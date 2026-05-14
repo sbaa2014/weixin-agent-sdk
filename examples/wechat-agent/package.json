@@ -1,0 +1,13 @@
+{
+  "name": "wechat-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "agent.mjs",
+  "bin": {
+    "wechat-agent": "./agent.mjs"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^0.17.0",
+    "@anthropic-ai/sdk": "^0.81.0"
+  }
+}
