@@ -103,6 +103,42 @@ class Logger {
 
 const log = new Logger();
 
+// ─── Session Persistence ──────────────────────────────────────────────────
+
+const SESSIONS_FILE = path.join(os.homedir(), ".openclaw", "wechat-agent", "sessions.json");
+
+function saveSession(history, pendingText) {
+  const data = {
+    default: {
+      history: (history || []).slice(-40),
+      pendingText: pendingText || null,
+      updatedAt: new Date().toISOString(),
+    },
+  };
+  const tmp = SESSIONS_FILE + ".tmp";
+  try {
+    fs.mkdirSync(path.dirname(SESSIONS_FILE), { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf-8");
+    fs.renameSync(tmp, SESSIONS_FILE);
+    log.info(`session.save history=${data.default.history.length} pending=${!!pendingText}`);
+  } catch (err) {
+    log.error("session.save.error", err.message);
+    try { fs.unlinkSync(tmp); } catch {}
+  }
+}
+
+function loadSession() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf-8"));
+    const s = raw.default;
+    if (s && Array.isArray(s.history)) {
+      log.info(`session.load history=${s.history.length} pending=${!!s.pendingText}`);
+      return { history: s.history, pendingText: s.pendingText || null };
+    }
+  } catch {}
+  return null;
+}
+
 // ─── Tools Definition ──────────────────────────────────────────────────────
 
 const TOOL_DEFINITIONS = [
@@ -208,22 +244,25 @@ async function toolWebSearch(query) {
 }
 
 function toolRunCode(language, code) {
-  const commands = {
-    python: ["python3", "-c"],
-    nodejs: ["node", "-e"],
-    bash: ["bash", "-c"],
-  };
-  const [cmd, flag] = commands[language] || commands.bash;
+  const exts = { python: ".py", nodejs: ".mjs", bash: ".sh" };
+  const cmds = { python: "python3", nodejs: "node", bash: "bash" };
+  const ext = exts[language] || ".sh";
+  const cmd = cmds[language] || "bash";
+  const tmpFile = path.join(os.tmpdir(), `agent-run-${Date.now()}${ext}`);
   try {
-    const output = execSync(`${cmd} ${flag} ${JSON.stringify(code)}`, {
+    fs.writeFileSync(tmpFile, code, "utf-8");
+    const output = execSync(`${cmd} ${JSON.stringify(tmpFile)}`, {
       encoding: "utf-8",
-      timeout: 30000,
-      maxBuffer: 1024 * 1024,
+      timeout: 60000,
+      maxBuffer: 2 * 1024 * 1024,
+      cwd: os.tmpdir(),
       env: { ...process.env, PATH: process.env.PATH },
     });
     return output || "(无输出)";
   } catch (err) {
     return `执行出错:\n${err.stderr || err.message}`;
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch {}
   }
 }
 
@@ -320,6 +359,7 @@ class MyAgent {
   constructor(connection) {
     this.connection = connection;
     this.sessions = new Map();
+    this.savedState = loadSession();
     this.client = new Anthropic({
       apiKey: ANTHROPIC_API_KEY,
       baseURL: ANTHROPIC_BASE_URL,
@@ -336,7 +376,16 @@ class MyAgent {
 
   async newSession(_params) {
     const sessionId = crypto.randomUUID();
-    this.sessions.set(sessionId, { history: [], pendingPrompt: null });
+    const session = { history: [], pendingPrompt: null, resumeText: null };
+
+    if (this.savedState) {
+      session.history = this.savedState.history || [];
+      session.resumeText = this.savedState.pendingText || null;
+      log.info(`session.restore id=${sessionId} history=${session.history.length} resume=${!!session.resumeText}`);
+      this.savedState = null;
+    }
+
+    this.sessions.set(sessionId, session);
     log.info(`session.new id=${sessionId}`);
     return { sessionId };
   }
@@ -392,18 +441,56 @@ class MyAgent {
       session.history = session.history.slice(-40);
     }
 
+    saveSession(session.history, userText);
+
     let toolCallCounter = 0;
     const MAX_TOOL_ROUNDS = 8;
 
+    // 思考状态追踪 — 每 2 分钟自动发送进度，直到处理完成
+    const thinkState = { phase: "思考中", tool: null, round: 0, errors: [], done: false };
+    const THINK_TIMEOUT = 2 * 60 * 1000;
+    const thinkStart = Date.now();
+    const thinkTimer = setInterval(async () => {
+      if (thinkState.done) return;
+      const elapsed = Math.round((Date.now() - thinkStart) / 1000);
+      const parts = [`[处理中] 已用时 ${elapsed} 秒`];
+      if (thinkState.tool) {
+        parts.push(`当前: 第${thinkState.round}轮工具调用 (${thinkState.tool})`);
+      } else {
+        parts.push(`当前: ${thinkState.phase}`);
+      }
+      if (thinkState.errors.length > 0) {
+        parts.push(`遇到 ${thinkState.errors.length} 个错误:`);
+        for (const e of thinkState.errors) parts.push(`  - ${e}`);
+      }
+      parts.push("请稍候，正在处理你的请求...");
+      try {
+        await this.sendText(sessionId, parts.join("\n"));
+        log.info(`think.notify sid=${sessionId.slice(0, 8)} elapsed=${elapsed}s phase=${thinkState.phase} errors=${thinkState.errors.length}`);
+      } catch (e) {
+        log.error("think.notify.error", e.message);
+      }
+    }, THINK_TIMEOUT);
+
+    try {
     while (toolCallCounter < MAX_TOOL_ROUNDS) {
+      thinkState.phase = "调用模型中";
+      thinkState.tool = null;
+
       const t0 = Date.now();
-      const response = await this.client.messages.create({
-        model: DEFAULT_MODEL,
-        max_tokens: 4096,
-        system: SYSTEM_PROMPT,
-        tools: TOOL_DEFINITIONS,
-        messages: session.history,
-      });
+      let response;
+      try {
+        response = await this.client.messages.create({
+          model: DEFAULT_MODEL,
+          max_tokens: 4096,
+          system: SYSTEM_PROMPT,
+          tools: TOOL_DEFINITIONS,
+          messages: session.history,
+        });
+      } catch (llmErr) {
+        thinkState.errors.push(`模型调用失败: ${llmErr.message}`);
+        throw llmErr;
+      }
       log.info(`llm.call ms=${Date.now() - t0} stop=${response.stop_reason} blocks=${response.content.length} usage=${JSON.stringify(response.usage)}`);
 
       let hasToolUse = false;
@@ -420,6 +507,9 @@ class MyAgent {
         if (block.type === "tool_use") {
           hasToolUse = true;
           toolCallCounter++;
+          thinkState.round = toolCallCounter;
+          thinkState.tool = block.name;
+          thinkState.phase = `执行工具 ${block.name}`;
           log.info(`tool.call tool=${block.name}`, block.input);
 
           await this.connection.sessionUpdate({
@@ -434,7 +524,14 @@ class MyAgent {
             },
           });
 
-          const result = await executeTool(this.client, block.name, block.input);
+          let result;
+          try {
+            result = await executeTool(this.client, block.name, block.input);
+          } catch (toolErr) {
+            result = `工具执行出错: ${toolErr.message}`;
+            thinkState.errors.push(`${block.name}: ${toolErr.message}`);
+            log.error(`tool.error tool=${block.name}`, toolErr.message);
+          }
 
           await this.connection.sessionUpdate({
             sessionId,
@@ -464,12 +561,33 @@ class MyAgent {
         break;
       }
     }
+    } finally {
+      thinkState.done = true;
+      clearInterval(thinkTimer);
+      saveSession(session.history, null);
+    }
   }
 
   // ─── Built-in Commands ─────────────────────────────────────────────────
 
   async handleCommand(sessionId, text) {
     const cmd = text.trim().toLowerCase();
+    const sid = sessionId.slice(0, 8);
+
+    if (cmd === "继续" || cmd === "/resume") {
+      const session = this.sessions.get(sessionId);
+      if (session?.resumeText) {
+        const resumeText = session.resumeText;
+        session.resumeText = null;
+        await this.sendText(sessionId, `正在继续处理: ${resumeText.slice(0, 50)}${resumeText.length > 50 ? "..." : ""}`);
+        log.info(`cmd.resume sid=${sid} text=${JSON.stringify(resumeText.slice(0, 100))}`);
+        await this.handleTurn(sessionId, session, [{ type: "text", text: resumeText }]);
+      } else {
+        await this.sendText(sessionId, "没有未完成的任务");
+      }
+      return true;
+    }
+
     if (cmd === "/version" || cmd === "版本" || cmd === "/v") {
       const uptime = this.formatUptime(Date.now() - AGENT_START_TIME.getTime());
       const info = [
@@ -478,25 +596,102 @@ class MyAgent {
         `Node: ${process.version}`,
         `启动: ${AGENT_START_TIME.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}`,
         `运行: ${uptime}`,
-        `会话数: ${this.sessions.size}`,
         `PID: ${process.pid}`,
       ].join("\n");
       await this.sendText(sessionId, info);
-      log.info(`cmd.version sid=${sessionId.slice(0, 8)}`);
+      log.info(`cmd.version sid=${sid}`);
       return true;
     }
+
+    if (cmd === "/status" || cmd === "状态") {
+      const session = this.sessions.get(sessionId);
+      const uptime = this.formatUptime(Date.now() - AGENT_START_TIME.getTime());
+      const mem = Math.round(process.memoryUsage().rss / 1024 / 1024);
+      const info = [
+        `运行状态:`,
+        `  运行时长: ${uptime}`,
+        `  内存占用: ${mem}MB`,
+        `  活跃会话: ${this.sessions.size}`,
+        `  本轮对话: ${session ? Math.floor(session.history.length / 2) : 0} 轮`,
+        `  历史条数: ${session ? session.history.length : 0}`,
+      ].join("\n");
+      await this.sendText(sessionId, info);
+      log.info(`cmd.status sid=${sid}`);
+      return true;
+    }
+
+    if (cmd === "/tools" || cmd === "工具") {
+      const list = TOOL_DEFINITIONS.map(
+        (t, i) => `${i + 1}. ${t.name}\n   ${t.description}`
+      ).join("\n");
+      await this.sendText(sessionId, `可用工具:\n${list}`);
+      log.info(`cmd.tools sid=${sid}`);
+      return true;
+    }
+
+    if (cmd === "/clear" || cmd === "清空" || cmd === "重置") {
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        const count = session.history.length;
+        session.history = [];
+        session.resumeText = null;
+        saveSession([], null);
+        await this.sendText(sessionId, `已清空对话记录 (${count} 条)`);
+        log.info(`cmd.clear sid=${sid} cleared=${count}`);
+      }
+      return true;
+    }
+
+    if (cmd === "/usage" || cmd === "用量") {
+      const lines = [];
+      try {
+        const logFile = path.join(LOG_DIR, "agent.log");
+        const content = fs.readFileSync(logFile, "utf-8");
+        const today = new Date().toISOString().slice(0, 10);
+        let totalIn = 0, totalOut = 0, calls = 0;
+        for (const line of content.split("\n")) {
+          if (!line.startsWith(today)) continue;
+          const m = line.match(/usage=(\{[^}]+\})/);
+          if (m) {
+            calls++;
+            try {
+              const u = JSON.parse(m[1]);
+              totalIn += (u.input_tokens || 0) + (u.cache_read_input_tokens || 0);
+              totalOut += u.output_tokens || 0;
+            } catch {}
+          }
+        }
+        lines.push(`今日 Token 用量:`);
+        lines.push(`  LLM 调用: ${calls} 次`);
+        lines.push(`  输入: ${totalIn.toLocaleString()} tokens`);
+        lines.push(`  输出: ${totalOut.toLocaleString()} tokens`);
+        lines.push(`  合计: ${(totalIn + totalOut).toLocaleString()} tokens`);
+      } catch {
+        lines.push("暂无用量数据");
+      }
+      await this.sendText(sessionId, lines.join("\n"));
+      log.info(`cmd.usage sid=${sid}`);
+      return true;
+    }
+
     if (cmd === "/help" || cmd === "帮助" || cmd === "/h") {
       const help = [
         "可用命令:",
-        "  /version (版本) — 查看版本和运行状态",
+        "  /v (版本) — 版本和构建信息",
+        "  /status (状态) — 运行状态和资源",
+        "  /tools (工具) — 查看可用工具列表",
+        "  /usage (用量) — 今日 Token 消耗",
+        "  /clear (清空) — 清除当前对话记录",
+        "  /resume (继续) — 继续上次未完成的任务",
         "  /help (帮助) — 显示此帮助",
         "",
-        "直接发消息即可对话，我会自动搜索、计算、翻译。",
+        "直接发消息即可对话，支持搜索、计算、翻译、编程。",
       ].join("\n");
       await this.sendText(sessionId, help);
-      log.info(`cmd.help sid=${sessionId.slice(0, 8)}`);
+      log.info(`cmd.help sid=${sid}`);
       return true;
     }
+
     return false;
   }
 

@@ -99,10 +99,35 @@ if (!contextToken) {
 }
 
 const now = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
+const model = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514";
+const nodeVer = process.version;
+const pid = process.ppid || process.pid;
+const mem = Math.round(process.memoryUsage().rss / 1024 / 1024);
+
+// 读取 session 状态
+const SESSIONS_FILE = path.join(HOME, ".openclaw", "wechat-agent", "sessions.json");
+let sessionStatus = "就绪，等待指令";
+try {
+  const raw = JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf-8"));
+  const s = raw.default;
+  if (s?.pendingText) {
+    const preview = s.pendingText.slice(0, 80) + (s.pendingText.length > 80 ? "..." : "");
+    sessionStatus = `有未完成的任务\n上次请求: ${preview}\n回复"继续"可恢复处理`;
+  } else if (s?.history?.length > 0) {
+    sessionStatus = `就绪，已恢复 ${s.history.length} 条对话记忆`;
+  }
+} catch {}
+
 const text = [
   `[重启通知] wechat-agent v${PKG.version} (build ${BUILD})`,
-  `模型: ${process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514"}`,
+  `模型: ${model}`,
+  `Node: ${nodeVer}  PID: ${pid}  内存: ${mem}MB`,
   `时间: ${now}`,
+  ``,
+  `状态: ${sessionStatus}`,
+  ``,
+  `可用工具: web_search, code_execute, url_fetch, sub_agent`,
+  `命令: /v /status /tools /usage /clear /resume /help`,
 ].join("\n");
 
 try {
