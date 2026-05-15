@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
 import { logger } from "../util/logger.js";
 import { generateId } from "../util/random.js";
 import type { WeixinMessage, MessageItem } from "../api/types.js";
@@ -19,11 +22,22 @@ function contextTokenKey(accountId: string, userId: string): string {
   return `${accountId}:${userId}`;
 }
 
+const CONTEXT_CACHE_PATH = path.join(os.homedir(), ".openclaw", "wechat-agent", "last-context.json");
+
+function persistContextToken(userId: string, token: string): void {
+  try {
+    fs.mkdirSync(path.dirname(CONTEXT_CACHE_PATH), { recursive: true });
+    const data = { [userId]: { contextToken: token, date: new Date().toISOString().slice(0, 10) } };
+    fs.writeFileSync(CONTEXT_CACHE_PATH, JSON.stringify(data), "utf-8");
+  } catch {}
+}
+
 /** Store a context token for a given account+user pair. */
 export function setContextToken(accountId: string, userId: string, token: string): void {
   const k = contextTokenKey(accountId, userId);
   logger.debug(`setContextToken: key=${k}`);
   contextTokenStore.set(k, token);
+  persistContextToken(userId, token);
 }
 
 /** Retrieve the cached context token for a given account+user pair. */
