@@ -135,7 +135,7 @@ class Logger {
   }
 
   _ts() {
-    return new Date().toISOString().replace("T", " ").slice(0, 19);
+    return new Date().toLocaleString("sv-SE", { timeZone: "Asia/Shanghai" }).replace("T", " ");
   }
 
   _write(level, msg, data) {
