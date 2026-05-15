@@ -121,6 +121,109 @@ async function sendWechatDirect(text) {
   }
 }
 
+// ─── WeChat Direct Image Send ─────────────────────────────────────────────
+
+const CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
+
+function aesEcbEncrypt(plaintext, key) {
+  const cipher = nodeCrypto.createCipheriv("aes-128-ecb", key, null);
+  return Buffer.concat([cipher.update(plaintext), cipher.final()]);
+}
+
+function aesEcbPaddedSize(plaintextSize) {
+  return Math.ceil((plaintextSize + 1) / 16) * 16;
+}
+
+function wechatApiHeaders() {
+  const uin = Buffer.from(String(nodeCrypto.randomBytes(4).readUInt32BE(0)), "utf-8").toString("base64");
+  return {
+    "Content-Type": "application/json",
+    "AuthorizationType": "ilink_bot_token",
+    "Authorization": `Bearer ${WECHAT_ACCOUNT.token}`,
+    "X-WECHAT-UIN": uin,
+  };
+}
+
+async function sendWechatImageDirect(imageBuf, mimeType) {
+  if (!WECHAT_ACCOUNT || !wechatContextToken) return false;
+  const baseUrl = WECHAT_ACCOUNT.baseUrl.replace(/\/+$/, "");
+  const toUserId = WECHAT_ACCOUNT.userId;
+
+  const rawsize = imageBuf.length;
+  const rawfilemd5 = nodeCrypto.createHash("md5").update(imageBuf).digest("hex");
+  const filesize = aesEcbPaddedSize(rawsize);
+  const filekey = nodeCrypto.randomBytes(16).toString("hex");
+  const aeskey = nodeCrypto.randomBytes(16);
+
+  // Step 1: getUploadUrl
+  const uploadResp = await fetch(`${baseUrl}/ilink/bot/getuploadurl`, {
+    method: "POST",
+    headers: wechatApiHeaders(),
+    body: JSON.stringify({
+      filekey, media_type: 1, to_user_id: toUserId,
+      rawsize, rawfilemd5, filesize, no_need_thumb: true,
+      aeskey: aeskey.toString("hex"),
+      base_info: { channel_version: "1.0.2" },
+    }),
+  });
+  if (!uploadResp.ok) throw new Error(`getUploadUrl ${uploadResp.status}`);
+  const uploadData = await uploadResp.json();
+
+  // Step 2: encrypt and upload to CDN
+  const ciphertext = aesEcbEncrypt(imageBuf, aeskey);
+  const uploadFullUrl = uploadData.upload_full_url?.trim();
+  const uploadParam = uploadData.upload_param;
+  let cdnUrl;
+  if (uploadFullUrl) cdnUrl = uploadFullUrl;
+  else if (uploadParam) cdnUrl = `${CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(uploadParam)}&filekey=${encodeURIComponent(filekey)}`;
+  else throw new Error("getUploadUrl: no upload URL returned");
+
+  let downloadParam;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const cdnResp = await fetch(cdnUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: new Uint8Array(ciphertext),
+    });
+    if (cdnResp.status >= 400 && cdnResp.status < 500) throw new Error(`CDN upload ${cdnResp.status}`);
+    if (cdnResp.status === 200) {
+      downloadParam = cdnResp.headers.get("x-encrypted-param");
+      if (downloadParam) break;
+    }
+    if (attempt === 3) throw new Error(`CDN upload failed after 3 attempts`);
+  }
+
+  // Step 3: send image message
+  const sendResp = await fetch(`${baseUrl}/ilink/bot/sendmessage`, {
+    method: "POST",
+    headers: wechatApiHeaders(),
+    body: JSON.stringify({
+      msg: {
+        from_user_id: "",
+        to_user_id: toUserId,
+        client_id: `img-${nodeCrypto.randomUUID()}`,
+        message_type: 2,
+        message_state: 2,
+        context_token: wechatContextToken,
+        item_list: [{
+          type: 2,
+          image_item: {
+            media: {
+              encrypt_query_param: downloadParam,
+              aes_key: Buffer.from(aeskey.toString("hex")).toString("base64"),
+              encrypt_type: 1,
+            },
+            mid_size: filesize,
+          },
+        }],
+      },
+      base_info: { channel_version: "1.0.2" },
+    }),
+  });
+  const sendText = await sendResp.text();
+  return sendResp.ok;
+}
+
 // ─── Logger ────────────────────────────────────────────────────────────────
 
 const LOG_DIR = process.env.AGENT_LOG_DIR || path.join(os.homedir(), ".openclaw", "wechat-agent", "logs");
@@ -376,11 +479,11 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: "fetch_url",
-    description: "抓取指定网页的内容，返回文本摘要。用于获取网页、API 数据等。",
+    description: "抓取指定URL的内容。如果是图片URL会自动发送到微信。重要：只使用你从搜索结果或网页中获得的真实URL，绝对不要自己猜测或编造URL！",
     input_schema: {
       type: "object",
       properties: {
-        url: { type: "string", description: "要抓取的 URL" },
+        url: { type: "string", description: "要抓取的真实URL（必须来自搜索结果或网页，不要自己构造）" },
       },
       required: ["url"],
     },
@@ -469,7 +572,6 @@ async function toolWebSearch(query) {
       await page.goto(url, { timeout: 20000, waitUntil: "networkidle2" });
       const text = await page.evaluate(() => {
         const results = [];
-        // 获取所有搜索结果容器
         const containers = document.querySelectorAll("[tpl], .result");
         for (const el of containers) {
           if (results.length >= 6) break;
@@ -477,8 +579,18 @@ async function toolWebSearch(query) {
           if (!h3) continue;
           const a = h3.querySelector("a");
           const title = h3.innerText.trim();
-          const href = a?.href || "";
-          // 获取摘要：取容器内除标题外的文本
+          // 百度真实URL: 优先 mu 属性 > data-log 中的 mu > a.href
+          let href = el.getAttribute("mu") || "";
+          if (!href) {
+            try {
+              const dl = el.getAttribute("data-log");
+              if (dl) { const p = JSON.parse(dl); href = p.mu || ""; }
+            } catch {}
+          }
+          if (!href) {
+            const cite = el.querySelector("a[data-is-main-url]");
+            href = cite?.getAttribute("href") || a?.href || "";
+          }
           const allText = el.innerText;
           const snippet = allText.replace(title, "").trim().split("\n").filter(l => l.length > 10).slice(0, 2).join(" ").slice(0, 150);
           if (title) results.push({ title, url: href, snippet });
@@ -486,9 +598,17 @@ async function toolWebSearch(query) {
         return results;
       });
       if (text.length === 0) {
-        // fallback: 直接取页面文本
         const bodyText = await page.evaluate(() => document.body.innerText);
         return `百度搜索 "${query}" 结果:\n\n${bodyText.slice(0, 2000)}`;
+      }
+      // 解析残留的百度跳转链接
+      for (const r of text) {
+        if (r.url && r.url.includes("baidu.com/link")) {
+          try {
+            const resp = await fetch(r.url, { method: "HEAD", redirect: "follow", signal: AbortSignal.timeout(5000) });
+            if (resp.url && !resp.url.includes("baidu.com")) r.url = resp.url;
+          } catch {}
+        }
       }
       return text
         .map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`)
@@ -552,7 +672,8 @@ function toolRunCode(language, code) {
 const IMAGE_EXTS = /\.(jpg|jpeg|png|gif|webp|bmp)(\?|$)/i;
 
 function validateImage(buf) {
-  if (!buf || buf.length < 1024) return null;
+  if (!buf || buf.length < 100) return null;
+  if (buf[0] === 0x3C) return null; // HTML page (<html>, <!DOCTYPE, etc.)
   const isJpeg = buf[0] === 0xFF && buf[1] === 0xD8;
   const isPng = buf[0] === 0x89 && buf[1] === 0x50;
   const isGif = buf[0] === 0x47 && buf[1] === 0x49;
@@ -562,94 +683,180 @@ function validateImage(buf) {
   return { base64: buf.toString("base64"), mimeType: `image/${ext}` };
 }
 
-async function downloadImageWithBrowser(url) {
-  if (!puppeteer) { log.info("img.browser.skip no-puppeteer"); return null; }
+// 通用浏览器下载：用 CDP Fetch 拦截获取原始字节
+// 返回 { imageBuf } 如果响应是图片，{ html } 如果是网页，null 如果失败
+// expectImage=true 时，非图片响应直接返回 null
+async function browserFetch(url, { expectImage = false } = {}) {
+  if (!puppeteer) return null;
   try {
-    const result = await Promise.race([
+    return await Promise.race([
       withBrowser(async (browser) => {
         const page = await browser.newPage();
         await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36");
-        const response = await page.goto(url, { timeout: 15000, waitUntil: "load" });
-        if (!response || !response.ok()) {
-          log.warn(`img.browser.fail status=${response?.status()} url=${url.slice(0, 80)}`);
+        const client = await page.createCDPSession();
+        await client.send("Fetch.enable", { patterns: [{ urlPattern: "*", requestStage: "Response" }] });
+        const bodyPromise = new Promise((resolve) => {
+          client.on("Fetch.requestPaused", async (evt) => {
+            try {
+              const status = evt.responseStatusCode || 0;
+              const ct = (evt.responseHeaders || []).find(h => h.name.toLowerCase() === "content-type")?.value || "";
+              if (status >= 400) {
+                await client.send("Fetch.continueResponse", { requestId: evt.requestId });
+                resolve({ error: `http${status}` });
+                return;
+              }
+              if (ct.startsWith("image/")) {
+                const { body, base64Encoded } = await client.send("Fetch.getResponseBody", { requestId: evt.requestId });
+                await client.send("Fetch.continueResponse", { requestId: evt.requestId });
+                const buf = base64Encoded ? Buffer.from(body, "base64") : Buffer.from(body, "binary");
+                resolve({ imageBuf: buf });
+                return;
+              }
+              if (expectImage) {
+                await client.send("Fetch.continueResponse", { requestId: evt.requestId });
+                resolve({ error: `not-image ct=${ct}` });
+                return;
+              }
+              await client.send("Fetch.continueResponse", { requestId: evt.requestId });
+              resolve({ isHtml: true });
+            } catch (e) {
+              try { await client.send("Fetch.continueResponse", { requestId: evt.requestId }); } catch {}
+              resolve({ error: e.message });
+            }
+          });
+        });
+        const waitUntil = expectImage ? "load" : "networkidle2";
+        page.goto(url, { timeout: 15000, waitUntil }).catch(() => {});
+        const result = await Promise.race([bodyPromise, new Promise((_, rej) => setTimeout(() => rej(new Error("cdp timeout")), 18000))]);
+        await client.detach();
+        if (result.error) {
+          log.warn(`browser.fetch.fail ${result.error} url=${url.slice(0, 80)}`);
           return null;
         }
-        const buf = await response.buffer();
-        log.info(`img.browser.ok url=${url.slice(0, 60)} size=${buf.length}`);
-        return buf;
+        if (result.imageBuf) {
+          log.info(`browser.fetch.image url=${url.slice(0, 60)} size=${result.imageBuf.length}`);
+          return { imageBuf: result.imageBuf };
+        }
+        if (result.isHtml) {
+          try { await page.waitForNetworkIdle({ timeout: 5000 }); } catch {}
+          const html = await page.content();
+          log.info(`browser.fetch.html url=${url.slice(0, 60)} len=${html.length}`);
+          return { html };
+        }
+        return null;
       }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("browser timeout 20s")), 20000)),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("browser timeout 25s")), 25000)),
     ]);
-    return result;
-  } catch (e) { log.error("img.browser.error", e.message); return null; }
+  } catch (e) { log.error("browser.fetch.error", e.message); return null; }
+}
+
+let consecutiveFetchFails = 0;
+
+// 图片验证 + 发送到微信（通用流程，供所有路径共用）
+async function sendImageToWechat(buf, url, sessionId, connection) {
+  log.info(`img.download size=${buf.length} first=${buf[0]},${buf[1]}`);
+  const validated = validateImage(buf);
+  if (!validated) {
+    const head = buf.slice(0, 20).toString("utf-8").replace(/[^\x20-\x7e]/g, ".");
+    return `图片下载失败: 返回内容不是有效图片 (${buf.length} bytes, head="${head}")`;
+  }
+  // 优先直发微信
+  try {
+    const sent = await sendWechatImageDirect(buf, validated.mimeType);
+    if (sent) {
+      consecutiveFetchFails = 0;
+      log.info(`img.direct.ok url=${url.slice(0, 60)} size=${buf.length}`);
+      return `[已发送图片到微信] ${url} (${Math.round(buf.length / 1024)}KB)`;
+    }
+  } catch (e) {
+    log.error(`img.direct.fail url=${url.slice(0, 60)}`, e.message);
+  }
+  // fallback: ACP bridge
+  if (sessionId && connection) {
+    await connection.sessionUpdate({
+      sessionId,
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "image", data: validated.base64, mimeType: validated.mimeType } },
+    });
+    return `[已发送图片到微信] ${url} (${Math.round(buf.length / 1024)}KB)`;
+  }
+  return `[图片] ${url} (${Math.round(buf.length / 1024)}KB, 无法发送)`;
 }
 
 async function toolFetchUrl(url, sessionId, connection) {
-  // 如果是图片 URL，下载并发送到微信
-  if (IMAGE_EXTS.test(url)) {
+  // ── 统一下载：browserFetch 自动区分图片/网页 ──
+  const expectImage = IMAGE_EXTS.test(url);
+  const result = await browserFetch(url, { expectImage });
+
+  // 拿到图片数据 → 发送到微信
+  if (result?.imageBuf) {
+    return await sendImageToWechat(result.imageBuf, url, sessionId, connection);
+  }
+
+  // 显式图片 URL 但浏览器下载失败 → curl fallback
+  if (expectImage && !result?.html) {
     try {
-      // Use headless Chrome to download (bypasses anti-hotlinking)
-      let buf = await downloadImageWithBrowser(url);
-      // Fallback to curl if puppeteer unavailable or failed
-      if (!buf) {
-        log.info(`img.curl.fallback url=${url.slice(0, 80)}`);
-        const referer = new URL(url).origin + "/";
-        buf = execSync(
-          `curl -sL --fail ${JSON.stringify(url)} --max-time 15 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/125.0" -H "Referer: ${referer}"`,
-          { timeout: 20000, maxBuffer: 5 * 1024 * 1024 }
-        );
-      }
-      log.info(`img.download size=${buf.length} first=${buf[0]},${buf[1]}`);
-      const validated = validateImage(buf);
-      if (validated) {
-        if (sessionId && connection) {
-          await connection.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "agent_message_chunk",
-              content: { type: "image", data: validated.base64, mimeType: validated.mimeType },
-            },
-          });
-          return `[已发送图片到微信] ${url} (${Math.round(buf.length / 1024)}KB)`;
-        }
-        return `[图片] ${url} (${Math.round(buf.length / 1024)}KB, 无法发送)`;
-      }
-      return `图片下载失败: 返回内容不是有效图片 (${buf.length} bytes)`;
+      log.info(`img.curl.fallback url=${url.slice(0, 80)}`);
+      const referer = new URL(url).origin + "/";
+      const buf = execSync(
+        `curl -sL --fail ${JSON.stringify(url)} --max-time 15 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/125.0" -H "Referer: ${referer}"`,
+        { timeout: 20000, maxBuffer: 5 * 1024 * 1024 }
+      );
+      return await sendImageToWechat(buf, url, sessionId, connection);
     } catch (err) {
-      log.error(`img.download.error url=${url.slice(0, 80)}`, err.message);
+      log.error(`img.curl.error url=${url.slice(0, 80)}`, err.message);
       return `图片下载失败: ${err.message}`;
     }
   }
 
-  // 普通网页
+  // ── 网页处理路径 ──
+  let html = result?.html || null;
+  if (!html) {
+    try {
+      html = execSync(
+        `curl -sL ${JSON.stringify(url)} --max-time 15 -H "User-Agent: Mozilla/5.0"`,
+        { encoding: "utf-8", timeout: 20000, maxBuffer: 2 * 1024 * 1024 }
+      );
+    } catch (err) {
+      return `抓取失败: ${err.message}`;
+    }
+  }
+  if (!html) {
+    consecutiveFetchFails++;
+    let msg = `抓取失败: 页面返回错误 (404/5xx)，URL 可能不存在`;
+    if (consecutiveFetchFails >= 2) msg += `\n\n⚠️ 已连续 ${consecutiveFetchFails} 次抓取失败。请停止猜测URL！只使用搜索结果中返回的真实链接，或者换一个搜索词重新搜索。`;
+    return msg;
+  }
   try {
-    const html = execSync(
-      `curl -sL ${JSON.stringify(url)} --max-time 15 -H "User-Agent: Mozilla/5.0"`,
-      { encoding: "utf-8", timeout: 20000, maxBuffer: 2 * 1024 * 1024 }
-    );
-    // Extract image URLs from <img> tags
     const imgUrls = [];
-    const imgRegex = /<img[^>]+src=["']([^"']+)["'][^>]*/gi;
+    const imgRegex = /<img[^>]+(?:data-src|data-original|src)=["']([^"']+)["'][^>]*/gi;
     let imgMatch;
-    while ((imgMatch = imgRegex.exec(html)) && imgUrls.length < 10) {
+    while ((imgMatch = imgRegex.exec(html)) && imgUrls.length < 20) {
       let src = imgMatch[1];
+      if (src.startsWith("data:")) continue;
       if (src.startsWith("//")) src = "https:" + src;
-      else if (src.startsWith("/")) src = new URL(src, url).href;
-      if (/\.(jpg|jpeg|png|gif|webp)\b/i.test(src) && !/(icon|logo|avatar|sprite|loading|pixel|1x1)/i.test(src)) {
+      else if (!src.startsWith("http")) src = new URL(src, url).href;
+      if (/\.(jpg|jpeg|png|gif|webp)\b/i.test(src) && !/(icon|logo|avatar|sprite|loading|pixel|1x1|favicon|share|facebook|twitter|linkedin|weibo|weixin|wechat|qrcode|btn|button|arrow|close|search|menu|nav|banner_ad|advert|\/static\/|\/common\/|image_e\/)/i.test(src)) {
         imgUrls.push(src);
       }
     }
-
     const text = html
       .replace(/<script[\s\S]*?<\/script>/gi, "")
       .replace(/<style[\s\S]*?<\/style>/gi, "")
       .replace(/<[^>]*>/g, " ")
       .replace(/\s+/g, " ")
       .trim();
+    if (text.length < 50) {
+      consecutiveFetchFails++;
+      let msg = `页面无有效内容 (${text.length}字符)，URL 可能不存在或需要登录`;
+      if (consecutiveFetchFails >= 2) msg += `\n\n⚠️ 已连续 ${consecutiveFetchFails} 次抓取失败。请停止猜测URL！只使用搜索结果中返回的真实链接。`;
+      return msg;
+    }
+    consecutiveFetchFails = 0;
     let result = text.slice(0, 3000);
     if (text.length > 3000) result += "\n...(已截断)";
     if (imgUrls.length > 0) {
-      result += "\n\n[页面图片]:\n" + imgUrls.map((u, i) => `${i + 1}. ${u}`).join("\n");
+      result += "\n\n[页面图片（可直接用 fetch_url 下载发送）]:\n" + imgUrls.map((u, i) => `${i + 1}. ${u}`).join("\n");
+      result += "\n\n⚠️ 请直接用上面的完整URL调用 fetch_url 下载图片，不要自己构造URL。";
     }
     return result;
   } catch (err) {
@@ -674,7 +881,7 @@ async function toolDelegateAgent(client, agentType, task) {
       max_tokens: 2048,
       system: systemPrompt,
       messages: [{ role: "user", content: task }],
-    });
+    }, { timeout: 90_000 });
     return resp.content.map((b) => b.text || "").join("");
   } catch (err) {
     return `子 Agent (${agentType}) 处理失败: ${err.message}`;
@@ -718,6 +925,13 @@ const SYSTEM_PROMPT_BASE = `你是一个强大的 AI 助手，运行在微信上
 4. **子Agent委派** (delegate_agent) — 将专业任务委派给编程/翻译/分析专家
 
 重要：你可以发送图片！当你找到图片 URL 时，直接用 fetch_url 工具抓取该图片 URL，系统会自动将图片发送到微信。不要说"无法发送图片"。
+图片搜索技巧：
+- 绝对不要自己编造/猜测图片URL！只使用你从网页中实际看到的URL
+- 先用 fetch_url 打开一个图片索引页（如 unsplash.com 搜索页），从返回结果中找到真实图片URL，再用 fetch_url 下载那个图片URL
+- 优先用 unsplash.com、pexels.com 等开放图源搜索
+- 避免 gov.cn、www.news.cn 等有防盗链的国内站点，它们的图片 URL 会返回 HTML 而非图片
+- 如果一个图片 URL 下载失败，不要反复尝试同一个域名的其他路径，换个图源
+- 当 fetch_url 返回的结果中包含"[页面图片]"列表时，直接用列表中的URL下载，不要构造新URL
 
 规则:
 - 用中文回复，除非用户用其他语言提问
@@ -880,16 +1094,21 @@ class MyAgent {
     saveSession(session.history, userText);
 
     let toolCallCounter = 0;
-    const MAX_TOOL_ROUNDS = 8;
+    const MAX_TOOL_ROUNDS = 12;
     let turnSucceeded = false;
 
     // 任务编号
     if (!session._taskSeq) session._taskSeq = 0;
     session._taskSeq++;
     const taskId = `#${String(session._taskSeq).padStart(3, "0")}`;
+    let lastReplyText = null;
+    let imageSentDirect = false;
+    let imagesSentCount = 0;
+    const fetchLog = [];
+    consecutiveFetchFails = 0;
 
     // 思考状态追踪
-    const thinkState = { phase: "思考中", tool: null, round: 0, errors: [], done: false };
+    const thinkState = { phase: "思考中", tool: null, toolDetail: null, round: 0, errors: [], done: false };
     const THINK_INTERVAL = 60 * 1000;
     const thinkStart = Date.now();
     const sendProgress = async () => {
@@ -900,7 +1119,7 @@ class MyAgent {
       const timeStr = min > 0 ? `${min}分${sec}秒` : `${sec}秒`;
       const parts = [`[${taskId}] 处理中 | ${timeStr}`];
       if (thinkState.tool) {
-        parts.push(`🔧 第${thinkState.round}轮: ${thinkState.tool}`);
+        parts.push(`🔧 ${thinkState.tool}${thinkState.toolDetail ? `: ${thinkState.toolDetail}` : ""}`);
       } else {
         parts.push(`💭 ${thinkState.phase}`);
       }
@@ -915,8 +1134,9 @@ class MyAgent {
         log.error("think.notify.error", e.message);
       }
     };
-    // 5秒后发第一次，之后每60秒
-    const thinkFirstTimer = setTimeout(sendProgress, 5000);
+    // 立即发第一次，之后每60秒
+    sendProgress();
+    const thinkFirstTimer = null;
     const thinkTimer = setInterval(sendProgress, THINK_INTERVAL);
 
     try {
@@ -934,7 +1154,7 @@ class MyAgent {
           system: SYSTEM_PROMPT,
           tools: TOOL_DEFINITIONS,
           messages: safeMessages,
-        });
+        }, { timeout: 90_000 });
       } catch (llmErr) {
         thinkState.errors.push(`模型调用失败: ${llmErr.message}`);
         throw llmErr;
@@ -946,8 +1166,13 @@ class MyAgent {
 
       for (const block of response.content) {
         if (block.type === "text" && block.text) {
-          await this.sendText(sessionId, block.text);
-          log.info(`reply sid=${sessionId.slice(0, 8)} len=${block.text.length}`);
+          if (imageSentDirect && response.stop_reason === "end_turn") {
+            log.info(`reply.skip.image-sent sid=${sessionId.slice(0, 8)} len=${block.text.length}`);
+          } else {
+            await this.sendText(sessionId, block.text);
+            log.info(`reply sid=${sessionId.slice(0, 8)} len=${block.text.length}`);
+          }
+          lastReplyText = block.text;
         }
 
         if (block.type === "tool_use") {
@@ -955,6 +1180,7 @@ class MyAgent {
           toolCallCounter++;
           thinkState.round = toolCallCounter;
           thinkState.tool = block.name;
+          thinkState.toolDetail = this.toolProgressDetail(block.name, block.input);
           thinkState.phase = `执行工具 ${block.name}`;
           log.info(`tool.call tool=${block.name}`, block.input);
 
@@ -992,6 +1218,21 @@ class MyAgent {
             },
           });
 
+          if (typeof result === "string" && result.includes("[已发送图片到微信]")) {
+            imageSentDirect = true;
+            imagesSentCount++;
+          }
+          if (block.name === "fetch_url" && block.input?.url) {
+            const u = block.input.url;
+            let host; try { host = new URL(u).hostname; } catch { host = u.slice(0, 30); }
+            if (typeof result === "string" && result.includes("[已发送图片到微信]")) {
+              fetchLog.push({ host, ok: true, type: "image" });
+            } else if (typeof result === "string" && (result.includes("失败") || result.includes("不存在") || result.includes("不是有效图片"))) {
+              fetchLog.push({ host, ok: false, reason: result.slice(0, 40) });
+            } else {
+              fetchLog.push({ host, ok: true, type: "page" });
+            }
+          }
           toolResults.push({ type: "tool_result", tool_use_id: block.id, content: result });
         }
       }
@@ -1004,6 +1245,11 @@ class MyAgent {
       // Push assistant + tool results together (atomic, avoid orphan tool_use)
       session.history.push({ role: "assistant", content: response.content });
       session.history.push({ role: "user", content: toolResults });
+
+      if (imageSentDirect && toolResults.length === 1) {
+        log.info("tool.loop.break image already sent, skipping next LLM call");
+        break;
+      }
     }
 
     // If we exhausted tool rounds without a final text reply, force one without tools
@@ -1020,20 +1266,40 @@ class MyAgent {
         max_tokens: 2048,
         system: SYSTEM_PROMPT,
         messages: safeMessages,
-      });
+      }, { timeout: 90_000 });
       log.info(`reply.final.done blocks=${finalResp.content.length} stop=${finalResp.stop_reason}`);
       let hasFinalText = false;
       for (const block of finalResp.content) {
         if (block.type === "text" && block.text) {
           await this.sendText(sessionId, block.text);
+          lastReplyText = block.text;
           log.info(`reply.final sid=${sessionId.slice(0, 8)} len=${block.text.length}`);
           hasFinalText = true;
         }
       }
       if (!hasFinalText) {
-        const fallback = "抱歉，尝试了多种方式但未能完成任务，请换个方式描述或稍后再试。";
+        let fallback;
+        if (imageSentDirect) {
+          fallback = `以上是为你找到的 ${imagesSentCount} 张图片。`;
+        } else {
+          fallback = "抱歉，尝试了多种方式但未能完成任务，请换个方式描述或稍后再试。";
+        }
+        if (fetchLog.length > 0) {
+          const okList = fetchLog.filter(f => f.ok);
+          const failList = fetchLog.filter(f => !f.ok);
+          const parts = [];
+          if (okList.length > 0) {
+            const imgOk = okList.filter(f => f.type === "image");
+            const pageOk = okList.filter(f => f.type === "page");
+            if (imgOk.length > 0) parts.push(`成功下载 ${imgOk.length} 张图片（${[...new Set(imgOk.map(f => f.host))].join("、")}）`);
+            if (pageOk.length > 0) parts.push(`浏览了 ${pageOk.length} 个网页（${[...new Set(pageOk.map(f => f.host))].join("、")}）`);
+          }
+          if (failList.length > 0) parts.push(`${failList.length} 个链接失败（${[...new Set(failList.map(f => f.host))].join("、")}）`);
+          if (parts.length > 0) fallback += "\n" + parts.join("；");
+        }
         await this.sendText(sessionId, fallback);
-        log.info(`reply.final.fallback sid=${sessionId.slice(0, 8)}`);
+        lastReplyText = fallback;
+        log.info(`reply.final.fallback sid=${sessionId.slice(0, 8)} imageSent=${imagesSentCount}`);
         finalResp.content = [{ type: "text", text: fallback }];
       }
       session.history.push({ role: "assistant", content: finalResp.content });
@@ -1050,11 +1316,11 @@ class MyAgent {
         session.history.pop();
       }
       saveSession(session.history, turnSucceeded ? null : userText);
-      // 完成通知
       const elapsed = Math.round((Date.now() - thinkStart) / 1000);
-      if (turnSucceeded && elapsed >= 5) {
+      if (turnSucceeded) {
         const timeStr = elapsed >= 60 ? `${Math.floor(elapsed/60)}分${elapsed%60}秒` : `${elapsed}秒`;
-        sendWechatDirect(`[${taskId}] 已完成 | 用时 ${timeStr}`).catch(() => {});
+        const tag = `\n${taskId} 完成 | ${timeStr}`;
+        await this.sendText(sessionId, tag).catch(() => {});
       }
     }
   }
@@ -1218,10 +1484,7 @@ class MyAgent {
       if (item.type === "text" && item.text) {
         blocks.push({ type: "text", text: item.text });
       } else if (item.type === "image" && item.data) {
-        let mime = item.mimeType || "";
-        if (!mime || mime === "image/*") {
-          mime = detectImageMime(item.data);
-        }
+        const mime = detectImageMime(item.data);
         blocks.push({
           type: "image",
           source: { type: "base64", media_type: mime, data: item.data },
@@ -1267,6 +1530,16 @@ class MyAgent {
       delegate_agent: `委派给 ${input.agent_type || ""} agent`,
     };
     return titles[name] || name;
+  }
+
+  toolProgressDetail(name, input) {
+    switch (name) {
+      case "web_search": return input.query || "";
+      case "fetch_url": return input.url?.slice(0, 60) || "";
+      case "run_code": return `${input.language || "code"}`;
+      case "delegate_agent": return `${input.agent_type || ""}: ${(input.task || "").slice(0, 40)}`;
+      default: return "";
+    }
   }
 
   toolKind(name) {

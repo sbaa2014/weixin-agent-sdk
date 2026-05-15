@@ -114,7 +114,8 @@ start|--bg)
   BUILD=$(cat "$BUILD_FILE" 2>/dev/null || echo "?")
   echo "[start] build $BUILD"
 
-  # 启动 weixin-acp
+  # 启动 weixin-acp（在 home 目录下运行，避免权限问题）
+  cd "$HOME"
   npx weixin-acp start -- node "$DIR/agent.mjs" >>"$LOG" 2>&1 &
   BRIDGE_PID=$!
   echo "$BRIDGE_PID" > "$PIDFILE"
