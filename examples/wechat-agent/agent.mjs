@@ -37,6 +37,17 @@ const AGENT_START_TIME = new Date();
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
+// Load env from ~/.claude/settings.json (same config Claude Code uses)
+try {
+  const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
+  const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+  if (settings.env) {
+    for (const [k, v] of Object.entries(settings.env)) {
+      if (!process.env[k]) process.env[k] = v;
+    }
+  }
+} catch {}
+
 const ANTHROPIC_BASE_URL = process.env.ANTHROPIC_BASE_URL?.replace(/\/+$/, "") || undefined;
 const ANTHROPIC_API_KEY =
   process.env.ANTHROPIC_AUTH_TOKEN ||
