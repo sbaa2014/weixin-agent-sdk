@@ -194,15 +194,24 @@ try {
 } catch {}
 
 const text = [
-  `[重启通知] wechat-agent v${PKG.version} (build ${BUILD})`,
-  `模型: ${model}`,
-  `Node: ${nodeVer}  PID: ${pid}  内存: ${mem}MB`,
-  `时间: ${now}`,
+  `wechat-agent v${PKG.version} (build ${BUILD}) 已启动`,
+  `模型: ${model}  时间: ${now}`,
   ``,
-  `状态: ${sessionStatus}`,
+  `支持输入:`,
+  `  文字 — 直接发消息对话`,
+  `  图片 — 发图片即可识别/分析`,
+  `  文件 — 发送文档自动解读`,
   ``,
-  `可用工具: web_search, code_execute, url_fetch, sub_agent`,
-  `命令: /v /status /tools /usage /clear /resume /help`,
+  `技能:`,
+  `  联网搜索 — 新闻、天气、实时信息`,
+  `  代码执行 — Python/Node.js/Bash`,
+  `  网页抓取 — 获取网页内容、下载图片`,
+  `  发送图片 — 找到图片 URL 自动发到聊天`,
+  `  专家委派 — 编程/翻译/数据分析`,
+  ``,
+  `命令: /help /status /tools /usage /clear`,
+  ``,
+  `${sessionStatus}`,
 ].join("\n");
 
 try {
