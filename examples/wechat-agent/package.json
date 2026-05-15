@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.17.0",
-    "@anthropic-ai/sdk": "^0.81.0"
+    "@anthropic-ai/sdk": "^0.81.0",
+    "puppeteer": "^24.43.1"
   }
 }

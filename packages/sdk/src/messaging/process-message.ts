@@ -204,6 +204,20 @@ export async function processOneMessage(
   try {
     const response = await deps.agent.chat(request);
 
+    // Cancel typing immediately after agent returns (before sending reply)
+    if (typingTimer) { clearInterval(typingTimer); typingTimer = undefined; }
+    if (deps.typingTicket) {
+      sendTyping({
+        baseUrl: deps.baseUrl,
+        token: deps.token,
+        body: {
+          ilink_user_id: to,
+          typing_ticket: deps.typingTicket,
+          status: TypingStatus.CANCEL,
+        },
+      }).catch(() => {});
+    }
+
     if (response.media) {
       let filePath: string;
       const mediaUrl = response.media.url;

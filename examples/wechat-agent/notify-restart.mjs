@@ -2,10 +2,9 @@
 /**
  * 启动后向上次活跃用户推送重启通知
  *
- * 读取顺序:
- *   1. ~/wechat-agent/last-context.json         (自己保存的，最优先)
- *   2. ~/.wechat-acp/last-contexts.json     (wechat-acp 保存的)
- *   3. ~/.openclaw/.../accounts/*.json       (weixin-acp 保存的，需配合 getconfig)
+ * 获取 context_token 顺序:
+ *   1. 做一次短超时 getUpdates 拿最新 context_token
+ *   2. 回退到 ~/.openclaw/wechat-agent/last-context.json (缓存)
  */
 
 import fs from "node:fs";
@@ -21,9 +20,49 @@ const BUILD = (() => {
   catch { return 0; }
 })();
 
+const CONTEXT_CACHE = path.join(HOME, ".openclaw", "wechat-agent", "last-context.json");
+
 function randomUin() {
   return Buffer.from(String(crypto.randomBytes(4).readUInt32BE(0)), "utf-8").toString("base64");
 }
+
+// ─── getUpdates: 短超时拉一次，获取 context_token ────────────────────────────
+
+async function fetchContextToken(baseUrl, token, getUpdatesBuf) {
+  const url = `${baseUrl.replace(/\/+$/, "")}/ilink/bot/getupdates`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "AuthorizationType": "ilink_bot_token",
+        "Authorization": `Bearer ${token}`,
+        "X-WECHAT-UIN": randomUin(),
+      },
+      body: JSON.stringify({
+        get_updates_buf: getUpdatesBuf || "",
+        base_info: { channel_version: "1.0.2" },
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const data = await res.json();
+    // 从最后一条消息取 context_token
+    const msgs = data.msgs || [];
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].context_token) return msgs[i].context_token;
+    }
+    return null;
+  } catch {
+    clearTimeout(timer);
+    return null;
+  }
+}
+
+// ─── 发送文本消息 ─────────────────────────────────────────────────────────────
 
 async function sendText(baseUrl, token, userId, contextToken, text) {
   const url = `${baseUrl.replace(/\/+$/, "")}/ilink/bot/sendmessage`;
@@ -66,22 +105,38 @@ function findAccount() {
   return null;
 }
 
-// ─── 找 context_token ──────────────────────────────────────────────────────
+// ─── 找 get_updates_buf ───────────────────────────────────────────────────────
 
-function findContext(userId) {
-  // 1. 自己保存的
+function findSyncBuf() {
+  const dir = path.join(HOME, ".openclaw", "openclaw-weixin", "accounts");
   try {
-    const data = JSON.parse(fs.readFileSync(path.join(AGENT_DIR, "last-context.json"), "utf-8"));
-    if (data.userId === userId && data.contextToken) return data.contextToken;
+    const files = fs.readdirSync(dir).filter(f => f.endsWith(".sync.json"));
+    for (const f of files) {
+      const data = JSON.parse(fs.readFileSync(path.join(dir, f), "utf-8"));
+      if (data.get_updates_buf) return data.get_updates_buf;
+    }
   } catch {}
+  return null;
+}
 
-  // 2. wechat-acp 保存的
+// ─── 找缓存的 context_token ──────────────────────────────────────────────────
+
+function findCachedContext(userId) {
   try {
-    const data = JSON.parse(fs.readFileSync(path.join(HOME, ".wechat-acp", "last-contexts.json"), "utf-8"));
+    const data = JSON.parse(fs.readFileSync(CONTEXT_CACHE, "utf-8"));
     if (data[userId]?.contextToken) return data[userId].contextToken;
   } catch {}
-
   return null;
+}
+
+// ─── 保存 context_token 到缓存 ───────────────────────────────────────────────
+
+function saveContextCache(userId, contextToken) {
+  try {
+    fs.mkdirSync(path.dirname(CONTEXT_CACHE), { recursive: true });
+    const data = { [userId]: { contextToken, date: new Date().toISOString().slice(0, 10) } };
+    fs.writeFileSync(CONTEXT_CACHE, JSON.stringify(data), "utf-8");
+  } catch {}
 }
 
 // ─── Main ──────────────────────────────────────────────────────────────────
@@ -92,7 +147,27 @@ if (!account) {
   process.exit(0);
 }
 
-const contextToken = findContext(account.userId);
+// 1) 尝试 getUpdates 拿新 token
+const syncBuf = findSyncBuf();
+let contextToken = null;
+
+if (syncBuf) {
+  console.log("[notify] 尝试 getUpdates 获取 context_token...");
+  contextToken = await fetchContextToken(account.baseUrl, account.token, syncBuf);
+  if (contextToken) {
+    console.log("[notify] 从 getUpdates 获取到新 context_token");
+    saveContextCache(account.userId, contextToken);
+  }
+}
+
+// 2) 回退到缓存
+if (!contextToken) {
+  contextToken = findCachedContext(account.userId);
+  if (contextToken) {
+    console.log("[notify] 使用缓存的 context_token");
+  }
+}
+
 if (!contextToken) {
   console.log("[notify] 未找到 context_token，跳过通知");
   process.exit(0);

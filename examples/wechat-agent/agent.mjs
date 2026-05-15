@@ -19,6 +19,7 @@ import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import nodeCrypto from "node:crypto";
 import * as acp from "@agentclientprotocol/sdk";
 import Anthropic from "@anthropic-ai/sdk";
 
@@ -42,6 +43,72 @@ const ANTHROPIC_API_KEY =
   process.env.ANTHROPIC_API_KEY ||
   "dummy";
 const DEFAULT_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514";
+
+// ─── WeChat Direct Send (bypass ACP for real-time notifications) ──────────
+
+function loadWechatAccount() {
+  const dir = path.join(os.homedir(), ".openclaw", "openclaw-weixin", "accounts");
+  try {
+    const files = fs.readdirSync(dir).filter(f => f.endsWith(".json") && !f.includes(".sync"));
+    for (const f of files) {
+      const data = JSON.parse(fs.readFileSync(path.join(dir, f), "utf-8"));
+      if (data.token && data.baseUrl && data.userId) return data;
+    }
+  } catch {}
+  return null;
+}
+
+const WECHAT_ACCOUNT = loadWechatAccount();
+let wechatContextToken = null;
+
+// Load cached context token
+try {
+  const cache = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".openclaw", "wechat-agent", "last-context.json"), "utf-8"));
+  const entry = cache[WECHAT_ACCOUNT?.userId];
+  if (entry?.contextToken) wechatContextToken = entry.contextToken;
+} catch {}
+
+// debug logged after Logger init below
+
+async function sendWechatDirect(text) {
+  if (!WECHAT_ACCOUNT || !wechatContextToken) {
+    log.warn(`direct-send.skip account=${!!WECHAT_ACCOUNT} token=${!!wechatContextToken}`);
+    return false;
+  }
+  const url = `${WECHAT_ACCOUNT.baseUrl.replace(/\/+$/, "")}/ilink/bot/sendmessage`;
+  const uin = Buffer.from(String(nodeCrypto.randomBytes(4).readUInt32BE(0)), "utf-8").toString("base64");
+  const body = JSON.stringify({
+    msg: {
+      from_user_id: "",
+      to_user_id: WECHAT_ACCOUNT.userId,
+      client_id: `notify-${nodeCrypto.randomUUID()}`,
+      message_type: 2,
+      message_state: 2,
+      context_token: wechatContextToken,
+      item_list: [{ type: 1, text_item: { text } }],
+    },
+    base_info: { channel_version: "1.0.2" },
+  });
+  log.info(`direct-send.attempt url=${url.slice(0, 40)} len=${text.length}`);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "AuthorizationType": "ilink_bot_token",
+        "Authorization": `Bearer ${WECHAT_ACCOUNT.token}`,
+        "X-WECHAT-UIN": uin,
+      },
+      body,
+    });
+    const resText = await res.text();
+    log.info(`direct-send.result status=${res.status} body=${resText.slice(0, 100)}`);
+    return res.ok;
+  } catch (e) {
+    log.error("direct-send.error", e.message);
+    return false;
+  }
+}
 
 // ─── Logger ────────────────────────────────────────────────────────────────
 
@@ -102,15 +169,28 @@ class Logger {
 }
 
 const log = new Logger();
+log.info(`direct-send.init account=${!!WECHAT_ACCOUNT} contextToken=${!!wechatContextToken}`);
 
 // ─── Session Persistence ──────────────────────────────────────────────────
 
 const SESSIONS_FILE = path.join(os.homedir(), ".openclaw", "wechat-agent", "sessions.json");
 
+function stripMediaForPersist(history) {
+  return (history || []).map(msg => {
+    if (!Array.isArray(msg.content)) return msg;
+    const stripped = msg.content.map(b => {
+      if (b.type === "image") return { type: "text", text: "[图片]" };
+      if (b.type === "document") return { type: "text", text: "[文档]" };
+      return b;
+    });
+    return { ...msg, content: stripped };
+  });
+}
+
 function saveSession(history, pendingText) {
   const data = {
     default: {
-      history: (history || []).slice(-40),
+      history: stripMediaForPersist(sanitizeHistory((history || []).slice(-40))),
       pendingText: pendingText || null,
       updatedAt: new Date().toISOString(),
     },
@@ -132,11 +212,123 @@ function loadSession() {
     const raw = JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf-8"));
     const s = raw.default;
     if (s && Array.isArray(s.history)) {
-      log.info(`session.load history=${s.history.length} pending=${!!s.pendingText}`);
-      return { history: s.history, pendingText: s.pendingText || null };
+      const history = sanitizeHistory(s.history);
+      log.info(`session.load history=${history.length} pending=${!!s.pendingText}`);
+      return { history, pendingText: s.pendingText || null };
     }
   } catch {}
   return null;
+}
+
+function sanitizeHistory(history) {
+  // Pass 1: pair tool_use with tool_result, strip broken pairs
+  const paired = [];
+  let i = 0;
+  while (i < history.length) {
+    const msg = history[i];
+
+    if (msg.role === "assistant" && Array.isArray(msg.content) && msg.content.some(b => b.type === "tool_use")) {
+      const toolUseIds = new Set(msg.content.filter(b => b.type === "tool_use").map(b => b.id));
+      const next = history[i + 1];
+      // Check if next is the matching tool_result
+      if (next && next.role === "user" && Array.isArray(next.content) &&
+          next.content.some(b => b.type === "tool_result" && toolUseIds.has(b.tool_use_id))) {
+        paired.push(msg);
+        paired.push(next);
+        i += 2;
+      } else {
+        // Strip tool_use, keep only text blocks
+        const textOnly = msg.content.filter(b => b.type === "text" && b.text);
+        if (textOnly.length > 0) {
+          paired.push({ role: "assistant", content: textOnly });
+        }
+        i++;
+      }
+    } else if (msg.role === "user" && Array.isArray(msg.content) && msg.content.some(b => b.type === "tool_result")) {
+      // Orphan tool_result — skip
+      i++;
+    } else {
+      paired.push(msg);
+      i++;
+    }
+  }
+
+  // Pass 2: build final sequence treating [assistant(tool_use), user(tool_result)] as atomic pairs
+  // Collect "segments": either a tool pair (assistant+user) or a standalone message
+  const segments = [];
+  for (let j = 0; j < paired.length; j++) {
+    const msg = paired[j];
+    const isAssistantWithToolUse = msg.role === "assistant" && Array.isArray(msg.content) &&
+      msg.content.some(b => b.type === "tool_use");
+    if (isAssistantWithToolUse) {
+      const nxt = paired[j + 1];
+      const hasResult = nxt && nxt.role === "user" && Array.isArray(nxt.content) &&
+        nxt.content.some(b => b.type === "tool_result");
+      if (hasResult) {
+        segments.push({ type: "tool_pair", assistant: msg, result: nxt });
+        j++;
+      } else {
+        // Orphan tool_use — keep only text
+        const textOnly = msg.content.filter(b => b.type === "text" && b.text);
+        if (textOnly.length > 0) segments.push({ type: "msg", msg: { role: "assistant", content: textOnly } });
+      }
+    } else if (msg.role === "user" && Array.isArray(msg.content) && msg.content.every(b => b.type === "tool_result")) {
+      // Orphan tool_result — skip
+    } else {
+      segments.push({ type: "msg", msg });
+    }
+  }
+
+  // Flatten segments into a valid message sequence with strict alternation
+  const result = [];
+  for (const seg of segments) {
+    if (seg.type === "tool_pair") {
+      const last = result[result.length - 1];
+      if (last && last.role === "assistant") continue;
+      if (!last || last.role === "user") {
+        result.push(seg.assistant);
+        result.push(seg.result);
+      }
+    } else {
+      const msg = seg.msg;
+      const last = result[result.length - 1];
+      if (!last) {
+        if (msg.role === "user") result.push(msg);
+        continue;
+      }
+      if (last.role === msg.role) {
+        if (msg.role === "user") {
+          // Pop tool pairs upward until we reach a non-tool-result user or a safe point
+          while (result.length > 0) {
+            const top = result[result.length - 1];
+            if (!(top.role === "user" && Array.isArray(top.content) && top.content.some(b => b.type === "tool_result"))) break;
+            result.pop(); // remove tool_result
+            const assist = result[result.length - 1];
+            if (assist && assist.role === "assistant" && Array.isArray(assist.content) &&
+                assist.content.some(b => b.type === "tool_use")) {
+              const textOnly = assist.content.filter(b => b.type === "text" && b.text);
+              if (textOnly.length > 0) { assist.content = textOnly; break; }
+              else { result.pop(); }
+            } else { break; }
+          }
+          const newLast = result[result.length - 1];
+          if (!newLast || newLast.role !== "user") result.push(msg);
+          else result[result.length - 1] = msg;
+        }
+        continue;
+      }
+      result.push(msg);
+    }
+  }
+
+  // Ensure starts with a plain user message (not tool_result)
+  while (result.length) {
+    const first = result[0];
+    if (first.role === "user" && !(Array.isArray(first.content) && first.content.every(b => b.type === "tool_result"))) break;
+    result.shift();
+  }
+
+  return result;
 }
 
 // ─── Tools Definition ──────────────────────────────────────────────────────
@@ -203,7 +395,101 @@ const TOOL_DEFINITIONS = [
 
 // ─── Tool Implementations ──────────────────────────────────────────────────
 
+// ─── Browser Pool (max 2 concurrent, memory-limited) ─────────────────────
+
+let puppeteer;
+try { puppeteer = await import("puppeteer"); } catch { puppeteer = null; }
+
+const BROWSER_MAX_CONCURRENT = 2;
+let browserActive = 0;
+const browserQueue = [];
+
+function acquireBrowser() {
+  return new Promise((resolve) => {
+    if (browserActive < BROWSER_MAX_CONCURRENT) {
+      browserActive++;
+      resolve();
+    } else {
+      browserQueue.push(resolve);
+    }
+  });
+}
+
+function releaseBrowser() {
+  if (browserQueue.length > 0) {
+    browserQueue.shift()();
+  } else {
+    browserActive--;
+  }
+}
+
+async function withBrowser(fn) {
+  await acquireBrowser();
+  let browser;
+  try {
+    browser = await puppeteer.default.launch({
+      headless: "shell",
+      args: [
+        "--no-sandbox",
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--js-flags=--max-old-space-size=128",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--single-process",
+      ],
+    });
+    return await fn(browser);
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+    releaseBrowser();
+  }
+}
+
 async function toolWebSearch(query) {
+  if (!puppeteer) {
+    return toolWebSearchFallback(query);
+  }
+  try {
+    return await withBrowser(async (browser) => {
+      const page = await browser.newPage();
+      await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36");
+      const url = `https://www.baidu.com/s?wd=${encodeURIComponent(query)}`;
+      await page.goto(url, { timeout: 20000, waitUntil: "networkidle2" });
+      const text = await page.evaluate(() => {
+        const results = [];
+        // 获取所有搜索结果容器
+        const containers = document.querySelectorAll("[tpl], .result");
+        for (const el of containers) {
+          if (results.length >= 6) break;
+          const h3 = el.querySelector("h3");
+          if (!h3) continue;
+          const a = h3.querySelector("a");
+          const title = h3.innerText.trim();
+          const href = a?.href || "";
+          // 获取摘要：取容器内除标题外的文本
+          const allText = el.innerText;
+          const snippet = allText.replace(title, "").trim().split("\n").filter(l => l.length > 10).slice(0, 2).join(" ").slice(0, 150);
+          if (title) results.push({ title, url: href, snippet });
+        }
+        return results;
+      });
+      if (text.length === 0) {
+        // fallback: 直接取页面文本
+        const bodyText = await page.evaluate(() => document.body.innerText);
+        return `百度搜索 "${query}" 结果:\n\n${bodyText.slice(0, 2000)}`;
+      }
+      return text
+        .map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`)
+        .join("\n\n");
+    });
+  } catch (err) {
+    log.warn(`search.browser.fail query=${query}`, err.message);
+    return toolWebSearchFallback(query);
+  }
+}
+
+function toolWebSearchFallback(query) {
   try {
     const encoded = encodeURIComponent(query);
     const html = execSync(
@@ -211,33 +497,19 @@ async function toolWebSearch(query) {
       { encoding: "utf-8", timeout: 15000 }
     );
     const results = [];
-    const linkRegex =
-      /<a[^>]+class="result-link"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
-    const snippetRegex =
-      /<td class="result-snippet">([\s\S]*?)<\/td>/gi;
-
+    const linkRegex = /<a[^>]+class="result-link"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+    const snippetRegex = /<td class="result-snippet">([\s\S]*?)<\/td>/gi;
     let match;
     while ((match = linkRegex.exec(html)) && results.length < 5) {
-      results.push({
-        url: match[1],
-        title: match[2].replace(/<[^>]*>/g, "").trim(),
-      });
+      results.push({ url: match[1], title: match[2].replace(/<[^>]*>/g, "").trim() });
     }
     let i = 0;
     while ((match = snippetRegex.exec(html)) && i < results.length) {
       results[i].snippet = match[1].replace(/<[^>]*>/g, "").trim();
       i++;
     }
-
-    if (results.length === 0) {
-      return `搜索 "${query}" 未找到明确结果。请尝试换个关键词。`;
-    }
-    return results
-      .map(
-        (r, idx) =>
-          `${idx + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet || ""}`
-      )
-      .join("\n\n");
+    if (results.length === 0) return `搜索 "${query}" 未找到结果。`;
+    return results.map((r, idx) => `${idx + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet || ""}`).join("\n\n");
   } catch (err) {
     return `搜索失败: ${err.message}`;
   }
@@ -266,20 +538,109 @@ function toolRunCode(language, code) {
   }
 }
 
-async function toolFetchUrl(url) {
+const IMAGE_EXTS = /\.(jpg|jpeg|png|gif|webp|bmp)(\?|$)/i;
+
+function validateImage(buf) {
+  if (!buf || buf.length < 1024) return null;
+  const isJpeg = buf[0] === 0xFF && buf[1] === 0xD8;
+  const isPng = buf[0] === 0x89 && buf[1] === 0x50;
+  const isGif = buf[0] === 0x47 && buf[1] === 0x49;
+  const isWebp = buf.length > 12 && buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50;
+  if (!isJpeg && !isPng && !isGif && !isWebp) return null;
+  const ext = isJpeg ? "jpeg" : isPng ? "png" : isGif ? "gif" : "webp";
+  return { base64: buf.toString("base64"), mimeType: `image/${ext}` };
+}
+
+async function downloadImageWithBrowser(url) {
+  if (!puppeteer) { log.info("img.browser.skip no-puppeteer"); return null; }
+  try {
+    const result = await Promise.race([
+      withBrowser(async (browser) => {
+        const page = await browser.newPage();
+        await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36");
+        const response = await page.goto(url, { timeout: 15000, waitUntil: "load" });
+        if (!response || !response.ok()) {
+          log.warn(`img.browser.fail status=${response?.status()} url=${url.slice(0, 80)}`);
+          return null;
+        }
+        const buf = await response.buffer();
+        log.info(`img.browser.ok url=${url.slice(0, 60)} size=${buf.length}`);
+        return buf;
+      }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("browser timeout 20s")), 20000)),
+    ]);
+    return result;
+  } catch (e) { log.error("img.browser.error", e.message); return null; }
+}
+
+async function toolFetchUrl(url, sessionId, connection) {
+  // 如果是图片 URL，下载并发送到微信
+  if (IMAGE_EXTS.test(url)) {
+    try {
+      // Use headless Chrome to download (bypasses anti-hotlinking)
+      let buf = await downloadImageWithBrowser(url);
+      // Fallback to curl if puppeteer unavailable or failed
+      if (!buf) {
+        log.info(`img.curl.fallback url=${url.slice(0, 80)}`);
+        const referer = new URL(url).origin + "/";
+        buf = execSync(
+          `curl -sL --fail ${JSON.stringify(url)} --max-time 15 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/125.0" -H "Referer: ${referer}"`,
+          { timeout: 20000, maxBuffer: 5 * 1024 * 1024 }
+        );
+      }
+      log.info(`img.download size=${buf.length} first=${buf[0]},${buf[1]}`);
+      const validated = validateImage(buf);
+      if (validated) {
+        if (sessionId && connection) {
+          await connection.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "image", data: validated.base64, mimeType: validated.mimeType },
+            },
+          });
+          return `[已发送图片到微信] ${url} (${Math.round(buf.length / 1024)}KB)`;
+        }
+        return `[图片] ${url} (${Math.round(buf.length / 1024)}KB, 无法发送)`;
+      }
+      return `图片下载失败: 返回内容不是有效图片 (${buf.length} bytes)`;
+    } catch (err) {
+      log.error(`img.download.error url=${url.slice(0, 80)}`, err.message);
+      return `图片下载失败: ${err.message}`;
+    }
+  }
+
+  // 普通网页
   try {
     const html = execSync(
       `curl -sL ${JSON.stringify(url)} --max-time 15 -H "User-Agent: Mozilla/5.0"`,
       { encoding: "utf-8", timeout: 20000, maxBuffer: 2 * 1024 * 1024 }
     );
+    // Extract image URLs from <img> tags
+    const imgUrls = [];
+    const imgRegex = /<img[^>]+src=["']([^"']+)["'][^>]*/gi;
+    let imgMatch;
+    while ((imgMatch = imgRegex.exec(html)) && imgUrls.length < 10) {
+      let src = imgMatch[1];
+      if (src.startsWith("//")) src = "https:" + src;
+      else if (src.startsWith("/")) src = new URL(src, url).href;
+      if (/\.(jpg|jpeg|png|gif|webp)\b/i.test(src) && !/(icon|logo|avatar|sprite|loading|pixel|1x1)/i.test(src)) {
+        imgUrls.push(src);
+      }
+    }
+
     const text = html
       .replace(/<script[\s\S]*?<\/script>/gi, "")
       .replace(/<style[\s\S]*?<\/style>/gi, "")
       .replace(/<[^>]*>/g, " ")
       .replace(/\s+/g, " ")
       .trim();
-    const truncated = text.slice(0, 4000);
-    return truncated + (text.length > 4000 ? "\n...(已截断)" : "");
+    let result = text.slice(0, 3000);
+    if (text.length > 3000) result += "\n...(已截断)";
+    if (imgUrls.length > 0) {
+      result += "\n\n[页面图片]:\n" + imgUrls.map((u, i) => `${i + 1}. ${u}`).join("\n");
+    }
+    return result;
   } catch (err) {
     return `抓取失败: ${err.message}`;
   }
@@ -311,7 +672,7 @@ async function toolDelegateAgent(client, agentType, task) {
 
 // ─── Execute Tool ──────────────────────────────────────────────────────────
 
-async function executeTool(client, name, input) {
+async function executeTool(client, name, input, sessionId, connection) {
   const t0 = Date.now();
   let result;
   try {
@@ -321,7 +682,7 @@ async function executeTool(client, name, input) {
       case "run_code":
         result = toolRunCode(input.language, input.code); break;
       case "fetch_url":
-        result = await toolFetchUrl(input.url); break;
+        result = await toolFetchUrl(input.url, sessionId, connection); break;
       case "delegate_agent":
         result = await toolDelegateAgent(client, input.agent_type, input.task); break;
       default:
@@ -337,13 +698,15 @@ async function executeTool(client, name, input) {
 
 // ─── System Prompt ─────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `你是一个强大的 AI 助手，运行在微信上，名叫"小助手"。
+const SYSTEM_PROMPT_BASE = `你是一个强大的 AI 助手，运行在微信上，名叫"小助手"。
 
 你具备以下能力，请在合适的时候主动使用:
 1. **联网搜索** (web_search) — 搜索最新信息、新闻、知识
 2. **代码执行** (run_code) — 运行 Python/Node.js/Bash 代码来计算或验证
-3. **网页抓取** (fetch_url) — 获取网页内容
+3. **网页抓取/发图片** (fetch_url) — 获取网页内容；如果 URL 是图片（.jpg/.png/.gif/.webp），会自动下载并发送到微信聊天中
 4. **子Agent委派** (delegate_agent) — 将专业任务委派给编程/翻译/分析专家
+
+重要：你可以发送图片！当你找到图片 URL 时，直接用 fetch_url 工具抓取该图片 URL，系统会自动将图片发送到微信。不要说"无法发送图片"。
 
 规则:
 - 用中文回复，除非用户用其他语言提问
@@ -352,6 +715,35 @@ const SYSTEM_PROMPT = `你是一个强大的 AI 助手，运行在微信上，�
 - 如果用户要求计算或验证，使用代码执行
 - 如果用户需要翻译或编程，可以委派给专门的子 agent
 - 不确定的信息要明确说明`;
+
+const CUSTOM_PROMPT_FILE = path.join(os.homedir(), ".openclaw", "wechat-agent", "system-prompt.md");
+
+function loadSystemPrompt() {
+  let prompt = SYSTEM_PROMPT_BASE;
+  try {
+    const custom = fs.readFileSync(CUSTOM_PROMPT_FILE, "utf-8").trim();
+    if (custom) {
+      prompt += "\n\n" + custom;
+      log.info(`system-prompt.loaded len=${custom.length}`);
+    }
+  } catch {}
+  return prompt;
+}
+
+const SYSTEM_PROMPT = loadSystemPrompt();
+
+// ─── Image MIME Detection ─────────────────────────────────────────────────
+
+function detectImageMime(base64Data) {
+  const head = base64Data.slice(0, 16);
+  const bytes = Buffer.from(head, "base64");
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
+  if (bytes[0] === 0xff && bytes[1] === 0xd8) return "image/jpeg";
+  if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return "image/gif";
+  if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+      bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return "image/webp";
+  return "image/jpeg";
+}
 
 // ─── ACP Agent Class ───────────────────────────────────────────────────────
 
@@ -370,7 +762,10 @@ class MyAgent {
   async initialize(_params) {
     return {
       protocolVersion: acp.PROTOCOL_VERSION,
-      agentCapabilities: { loadSession: false },
+      agentCapabilities: {
+        loadSession: false,
+        promptCapabilities: { image: true },
+      },
     };
   }
 
@@ -386,7 +781,7 @@ class MyAgent {
     }
 
     this.sessions.set(sessionId, session);
-    log.info(`session.new id=${sessionId}`);
+    log.info(`session.new id=${sessionId} params=${JSON.stringify(_params).slice(0, 200)}`);
     return { sessionId };
   }
 
@@ -401,7 +796,9 @@ class MyAgent {
     session.pendingPrompt = new AbortController();
 
     const userText = this.extractText(params.prompt);
-    log.info(`prompt sid=${params.sessionId.slice(0, 8)} text=${JSON.stringify(userText?.slice(0, 100))}`);
+    const hasImage = params.prompt?.some(b => b.type === "image");
+    log.info(`prompt sid=${params.sessionId.slice(0, 8)} text=${JSON.stringify(userText?.slice(0, 100))} hasImage=${hasImage}`);
+    log.info(`prompt.params keys=${JSON.stringify(Object.keys(params))}`);
 
     try {
       await this.handleTurn(params.sessionId, session, params.prompt);
@@ -426,51 +823,90 @@ class MyAgent {
   // ─── Core Turn Logic ──────────────────────────────────────────────────
 
   async handleTurn(sessionId, session, promptContent) {
+    const userContent = this.extractContent(promptContent);
     const userText = this.extractText(promptContent);
-    if (!userText) {
-      await this.sendText(sessionId, "请发送文字消息。");
+
+    if (!userContent) {
+      await this.sendText(sessionId, "请发送文字或图片消息。");
       return;
     }
 
-    // 内置命令 — 直接返回，不经过 LLM
-    const handled = await this.handleCommand(sessionId, userText);
-    if (handled) return;
+    // 内置命令 — 纯文字且以 / 或中文命令开头时检查
+    if (userText) {
+      const handled = await this.handleCommand(sessionId, userText);
+      if (handled) return;
+    }
 
-    session.history.push({ role: "user", content: userText });
+    // Clean up interrupted turn remnants before pushing new user message
+    while (session.history.length > 0 && session.history[session.history.length - 1].role === "user") {
+      session.history.pop();
+    }
+    // If last assistant msg has tool_use (now orphaned), strip tool_use keeping only text
+    const lastMsg = session.history[session.history.length - 1];
+    if (lastMsg && lastMsg.role === "assistant" && Array.isArray(lastMsg.content) && lastMsg.content.some(b => b.type === "tool_use")) {
+      const textOnly = lastMsg.content.filter(b => b.type === "text" && b.text);
+      if (textOnly.length > 0) {
+        lastMsg.content = textOnly;
+      } else {
+        session.history.pop();
+      }
+    }
+
+    const hasMedia = userContent.some(b => b.type === "image" || b.type === "document");
+    if (hasMedia) {
+      const hasText = userContent.some(b => b.type === "text");
+      const defaultPrompt = userContent.some(b => b.type === "document")
+        ? "请分析这个文档" : "请描述这张图片";
+      const content = hasText ? userContent : [...userContent, { type: "text", text: defaultPrompt }];
+      session.history.push({ role: "user", content });
+    } else {
+      session.history.push({ role: "user", content: userText || userContent });
+    }
     if (session.history.length > 40) {
-      session.history = session.history.slice(-40);
+      session.history = sanitizeHistory(session.history.slice(-40));
     }
 
     saveSession(session.history, userText);
 
     let toolCallCounter = 0;
     const MAX_TOOL_ROUNDS = 8;
+    let turnSucceeded = false;
 
-    // 思考状态追踪 — 每 2 分钟自动发送进度，直到处理完成
+    // 任务编号
+    if (!session._taskSeq) session._taskSeq = 0;
+    session._taskSeq++;
+    const taskId = `#${String(session._taskSeq).padStart(3, "0")}`;
+
+    // 思考状态追踪
     const thinkState = { phase: "思考中", tool: null, round: 0, errors: [], done: false };
-    const THINK_TIMEOUT = 2 * 60 * 1000;
+    const THINK_INTERVAL = 60 * 1000;
     const thinkStart = Date.now();
-    const thinkTimer = setInterval(async () => {
+    const sendProgress = async () => {
       if (thinkState.done) return;
       const elapsed = Math.round((Date.now() - thinkStart) / 1000);
-      const parts = [`[处理中] 已用时 ${elapsed} 秒`];
+      const min = Math.floor(elapsed / 60);
+      const sec = elapsed % 60;
+      const timeStr = min > 0 ? `${min}分${sec}秒` : `${sec}秒`;
+      const parts = [`[${taskId}] 处理中 | ${timeStr}`];
       if (thinkState.tool) {
-        parts.push(`当前: 第${thinkState.round}轮工具调用 (${thinkState.tool})`);
+        parts.push(`🔧 第${thinkState.round}轮: ${thinkState.tool}`);
       } else {
-        parts.push(`当前: ${thinkState.phase}`);
+        parts.push(`💭 ${thinkState.phase}`);
       }
       if (thinkState.errors.length > 0) {
-        parts.push(`遇到 ${thinkState.errors.length} 个错误:`);
-        for (const e of thinkState.errors) parts.push(`  - ${e}`);
+        parts.push(`⚠️ ${thinkState.errors.length} 个错误:`);
+        for (const e of thinkState.errors) parts.push(`  · ${e}`);
       }
-      parts.push("请稍候，正在处理你的请求...");
       try {
-        await this.sendText(sessionId, parts.join("\n"));
-        log.info(`think.notify sid=${sessionId.slice(0, 8)} elapsed=${elapsed}s phase=${thinkState.phase} errors=${thinkState.errors.length}`);
+        const sent = await sendWechatDirect(parts.join("\n"));
+        log.info(`think.notify ${taskId} sid=${sessionId.slice(0, 8)} elapsed=${elapsed}s phase=${thinkState.phase} direct=${sent}`);
       } catch (e) {
         log.error("think.notify.error", e.message);
       }
-    }, THINK_TIMEOUT);
+    };
+    // 5秒后发第一次，之后每60秒
+    const thinkFirstTimer = setTimeout(sendProgress, 5000);
+    const thinkTimer = setInterval(sendProgress, THINK_INTERVAL);
 
     try {
     while (toolCallCounter < MAX_TOOL_ROUNDS) {
@@ -480,12 +916,13 @@ class MyAgent {
       const t0 = Date.now();
       let response;
       try {
+        const safeMessages = sanitizeHistory(session.history);
         response = await this.client.messages.create({
           model: DEFAULT_MODEL,
           max_tokens: 4096,
           system: SYSTEM_PROMPT,
           tools: TOOL_DEFINITIONS,
-          messages: session.history,
+          messages: safeMessages,
         });
       } catch (llmErr) {
         thinkState.errors.push(`模型调用失败: ${llmErr.message}`);
@@ -494,11 +931,9 @@ class MyAgent {
       log.info(`llm.call ms=${Date.now() - t0} stop=${response.stop_reason} blocks=${response.content.length} usage=${JSON.stringify(response.usage)}`);
 
       let hasToolUse = false;
-      const assistantContent = [];
+      const toolResults = [];
 
       for (const block of response.content) {
-        assistantContent.push(block);
-
         if (block.type === "text" && block.text) {
           await this.sendText(sessionId, block.text);
           log.info(`reply sid=${sessionId.slice(0, 8)} len=${block.text.length}`);
@@ -526,7 +961,7 @@ class MyAgent {
 
           let result;
           try {
-            result = await executeTool(this.client, block.name, block.input);
+            result = await executeTool(this.client, block.name, block.input, sessionId, this.connection);
           } catch (toolErr) {
             result = `工具执行出错: ${toolErr.message}`;
             thinkState.errors.push(`${block.name}: ${toolErr.message}`);
@@ -546,25 +981,70 @@ class MyAgent {
             },
           });
 
-          session.history.push({ role: "assistant", content: assistantContent });
-          session.history.push({
-            role: "user",
-            content: [
-              { type: "tool_result", tool_use_id: block.id, content: result },
-            ],
-          });
+          toolResults.push({ type: "tool_result", tool_use_id: block.id, content: result });
         }
       }
 
       if (!hasToolUse) {
-        session.history.push({ role: "assistant", content: assistantContent });
+        session.history.push({ role: "assistant", content: response.content });
         break;
       }
+
+      // Push assistant + tool results together (atomic, avoid orphan tool_use)
+      session.history.push({ role: "assistant", content: response.content });
+      session.history.push({ role: "user", content: toolResults });
     }
+
+    // If we exhausted tool rounds without a final text reply, force one without tools
+    const lastHistMsg = session.history[session.history.length - 1];
+    const needsFinal = lastHistMsg && lastHistMsg.role === "user" && Array.isArray(lastHistMsg.content) &&
+        lastHistMsg.content.some(b => b.type === "tool_result");
+    log.info(`reply.final.check needsFinal=${needsFinal} lastRole=${lastHistMsg?.role} histLen=${session.history.length}`);
+    if (needsFinal) {
+      thinkState.phase = "生成总结";
+      const safeMessages = sanitizeHistory(session.history);
+      log.info(`reply.final.call safeLen=${safeMessages.length}`);
+      const finalResp = await this.client.messages.create({
+        model: DEFAULT_MODEL,
+        max_tokens: 2048,
+        system: SYSTEM_PROMPT,
+        messages: safeMessages,
+      });
+      log.info(`reply.final.done blocks=${finalResp.content.length} stop=${finalResp.stop_reason}`);
+      let hasFinalText = false;
+      for (const block of finalResp.content) {
+        if (block.type === "text" && block.text) {
+          await this.sendText(sessionId, block.text);
+          log.info(`reply.final sid=${sessionId.slice(0, 8)} len=${block.text.length}`);
+          hasFinalText = true;
+        }
+      }
+      if (!hasFinalText) {
+        const fallback = "抱歉，尝试了多种方式但未能完成任务，请换个方式描述或稍后再试。";
+        await this.sendText(sessionId, fallback);
+        log.info(`reply.final.fallback sid=${sessionId.slice(0, 8)}`);
+        finalResp.content = [{ type: "text", text: fallback }];
+      }
+      session.history.push({ role: "assistant", content: finalResp.content });
+    }
+
+    turnSucceeded = true;
     } finally {
       thinkState.done = true;
+      clearTimeout(thinkFirstTimer);
       clearInterval(thinkTimer);
-      saveSession(session.history, null);
+      // Clean up orphan: if last msg is assistant with tool_use but no following tool_result
+      const last = session.history[session.history.length - 1];
+      if (last && last.role === "assistant" && Array.isArray(last.content) && last.content.some(b => b.type === "tool_use")) {
+        session.history.pop();
+      }
+      saveSession(session.history, turnSucceeded ? null : userText);
+      // 完成通知
+      const elapsed = Math.round((Date.now() - thinkStart) / 1000);
+      if (turnSucceeded && elapsed >= 5) {
+        const timeStr = elapsed >= 60 ? `${Math.floor(elapsed/60)}分${elapsed%60}秒` : `${elapsed}秒`;
+        sendWechatDirect(`[${taskId}] 已完成 | 用时 ${timeStr}`).catch(() => {});
+      }
     }
   }
 
@@ -718,6 +1198,44 @@ class MyAgent {
       }
     }
     return "";
+  }
+
+  extractContent(prompt) {
+    if (!prompt) return null;
+    const blocks = [];
+    for (const item of prompt) {
+      if (item.type === "text" && item.text) {
+        blocks.push({ type: "text", text: item.text });
+      } else if (item.type === "image" && item.data) {
+        let mime = item.mimeType || "";
+        if (!mime || mime === "image/*") {
+          mime = detectImageMime(item.data);
+        }
+        blocks.push({
+          type: "image",
+          source: { type: "base64", media_type: mime, data: item.data },
+        });
+      } else if (item.type === "resource" && item.resource) {
+        const res = item.resource;
+        const mime = res.mimeType || "application/octet-stream";
+        const data = res.blob || res.text;
+        if (!data) continue;
+        if (mime === "application/pdf") {
+          blocks.push({
+            type: "document",
+            source: { type: "base64", media_type: mime, data },
+          });
+        } else if (mime.startsWith("text/") || mime === "application/json") {
+          const text = res.text || Buffer.from(data, "base64").toString("utf-8");
+          const name = res.uri?.split("/").pop() || "file";
+          blocks.push({ type: "text", text: `[文件: ${name}]\n${text}` });
+        } else {
+          const name = res.uri?.split("/").pop() || "file";
+          blocks.push({ type: "text", text: `[收到文件: ${name} (${mime})，暂不支持此格式的内容解析]` });
+        }
+      }
+    }
+    return blocks.length > 0 ? blocks : null;
   }
 
   async sendText(sessionId, text) {

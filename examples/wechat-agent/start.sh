@@ -106,6 +106,9 @@ start|--bg)
 
   set -e
 
+  # 清理超过1天的媒体缓存
+  find /tmp/weixin-agent/media -type f -mtime +1 -delete 2>/dev/null
+
   # build 号来自程序目录（共享）
   BUILD_FILE="$DIR/.build"
   BUILD=$(cat "$BUILD_FILE" 2>/dev/null || echo "?")
