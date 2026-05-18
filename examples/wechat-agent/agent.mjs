@@ -1137,6 +1137,7 @@ class MyAgent {
     let toolCallCounter = 0;
     const MAX_TOOL_ROUNDS = 8;
     let turnSucceeded = false;
+    let turnTokensIn = 0, turnTokensOut = 0, turnLLMCalls = 0;
 
     // 任务编号
     if (!session._taskSeq) session._taskSeq = 0;
@@ -1201,6 +1202,11 @@ class MyAgent {
         throw llmErr;
       }
       log.info(`llm.call ms=${Date.now() - t0} stop=${response.stop_reason} blocks=${response.content.length} usage=${JSON.stringify(response.usage)}`);
+      if (response.usage) {
+        turnTokensIn += response.usage.input_tokens || 0;
+        turnTokensOut += response.usage.output_tokens || 0;
+        turnLLMCalls++;
+      }
 
       let hasToolUse = false;
       const toolResults = [];
@@ -1311,6 +1317,11 @@ class MyAgent {
         messages: safeMessages,
       }, { timeout: 90_000 });
       log.info(`reply.final.done blocks=${finalResp.content.length} stop=${finalResp.stop_reason}`);
+      if (finalResp.usage) {
+        turnTokensIn += finalResp.usage.input_tokens || 0;
+        turnTokensOut += finalResp.usage.output_tokens || 0;
+        turnLLMCalls++;
+      }
       let hasFinalText = false;
       for (const block of finalResp.content) {
         if (block.type === "text" && block.text) {
@@ -1362,7 +1373,8 @@ class MyAgent {
       const elapsed = Math.round((Date.now() - thinkStart) / 1000);
       if (turnSucceeded) {
         const timeStr = elapsed >= 60 ? `${Math.floor(elapsed/60)}分${elapsed%60}秒` : `${elapsed}秒`;
-        const tag = `\n${taskId} 完成 | ${timeStr}`;
+        const tokenStr = turnTokensIn > 0 ? ` | ${((turnTokensIn + turnTokensOut) / 1000).toFixed(1)}k tokens` : "";
+        const tag = `\n${taskId} 完成 | ${timeStr}${tokenStr}`;
         await this.sendText(sessionId, tag).catch(() => {});
       }
     }
