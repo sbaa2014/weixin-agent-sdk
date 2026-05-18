@@ -442,6 +442,25 @@ function sanitizeHistory(history) {
     result.shift();
   }
 
+  // Compress old tool_results: keep last 3 tool pairs full, truncate older ones to 200 chars
+  const KEEP_FULL = 3;
+  const TRUNCATE_LEN = 200;
+  let toolPairCount = 0;
+  for (let k = result.length - 1; k >= 0; k--) {
+    const msg = result[k];
+    if (msg.role === "user" && Array.isArray(msg.content) && msg.content.some(b => b.type === "tool_result")) {
+      toolPairCount++;
+      if (toolPairCount > KEEP_FULL) {
+        msg.content = msg.content.map(b => {
+          if (b.type === "tool_result" && typeof b.content === "string" && b.content.length > TRUNCATE_LEN) {
+            return { ...b, content: b.content.slice(0, TRUNCATE_LEN) + "...(已压缩)" };
+          }
+          return b;
+        });
+      }
+    }
+  }
+
   return result;
 }
 
@@ -960,7 +979,8 @@ const SYSTEM_PROMPT_BASE = `你是一个强大的 AI 助手，运行在微信上
 - 如果用户的问题需要最新信息（新闻、天气、股价等），主动使用搜索工具
 - 如果用户要求计算或验证，使用代码执行
 - 如果用户需要翻译或编程，可以委派给专门的子 agent
-- 不确定的信息要明确说明`;
+- 不确定的信息要明确说明
+- 搜索效率：尽量在 3-5 次搜索内收集足够信息就开始回答。如果前几次搜索已经有相关结果，不要反复换关键词重复搜索，直接基于已有信息回答即可。信息不完整时也应给出部分回答并说明局限`;
 
 const CUSTOM_PROMPT_FILE = path.join(os.homedir(), ".openclaw", "wechat-agent", "system-prompt.md");
 
@@ -1115,7 +1135,7 @@ class MyAgent {
     saveSession(session.history, userText);
 
     let toolCallCounter = 0;
-    const MAX_TOOL_ROUNDS = 12;
+    const MAX_TOOL_ROUNDS = 8;
     let turnSucceeded = false;
 
     // 任务编号
@@ -1431,7 +1451,7 @@ class MyAgent {
         let totalIn = 0, totalOut = 0, calls = 0;
         for (const line of content.split("\n")) {
           if (!line.startsWith(today)) continue;
-          const m = line.match(/usage=(\{[^}]+\})/);
+          const m = line.match(/usage=(\{.+\})\s*$/);
           if (m) {
             calls++;
             try {
