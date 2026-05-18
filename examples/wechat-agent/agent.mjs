@@ -1373,7 +1373,7 @@ class MyAgent {
       const elapsed = Math.round((Date.now() - thinkStart) / 1000);
       if (turnSucceeded) {
         const timeStr = elapsed >= 60 ? `${Math.floor(elapsed/60)}分${elapsed%60}秒` : `${elapsed}秒`;
-        const tokenStr = turnTokensIn > 0 ? ` | ${((turnTokensIn + turnTokensOut) / 1000).toFixed(1)}k tokens` : "";
+        const tokenStr = turnTokensIn > 0 ? ` | in:${(turnTokensIn / 1000).toFixed(1)}k out:${(turnTokensOut / 1000).toFixed(1)}k (${turnLLMCalls}次)` : "";
         const tag = `\n${taskId} 完成 | ${timeStr}${tokenStr}`;
         await this.sendText(sessionId, tag).catch(() => {});
       }
