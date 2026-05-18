@@ -16,8 +16,12 @@ const HOME = os.homedir();
 const AGENT_DIR = path.dirname(new URL(import.meta.url).pathname);
 const PKG = JSON.parse(fs.readFileSync(path.join(AGENT_DIR, "package.json"), "utf-8"));
 const BUILD = (() => {
-  try { return parseInt(fs.readFileSync(path.join(AGENT_DIR, ".build"), "utf-8").trim(), 10) || 0; }
-  catch { return 0; }
+  try {
+    const files = fs.readdirSync(AGENT_DIR).filter(f => f.endsWith(".mjs") || f.endsWith(".sh"));
+    const latest = Math.max(...files.map(f => fs.statSync(path.join(AGENT_DIR, f)).mtimeMs));
+    const d = new Date(latest);
+    return `${String(d.getMonth()+1).padStart(2,"0")}${String(d.getDate()).padStart(2,"0")}-${String(d.getHours()).padStart(2,"0")}${String(d.getMinutes()).padStart(2,"0")}`;
+  } catch { return "?"; }
 })();
 
 const CONTEXT_CACHE = path.join(HOME, ".openclaw", "wechat-agent", "last-context.json");
@@ -194,7 +198,7 @@ try {
 } catch {}
 
 const text = [
-  `wechat-agent v${PKG.version} (build ${BUILD}) 已启动`,
+  `wechat-agent v${PKG.version} (${BUILD}) 已启动`,
   `模型: ${model}  时间: ${now}`,
   ``,
   `支持输入:`,

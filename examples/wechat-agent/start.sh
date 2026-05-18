@@ -46,9 +46,9 @@ stop)
 
 status)
   # 版本信息（始终显示）
-  BUILD=$(cat "$DIR/.build" 2>/dev/null || echo "?")
+  BUILD=$(stat -c %Y "$DIR"/*.mjs "$DIR"/*.sh 2>/dev/null | sort -rn | head -1 | xargs -I{} date -d @{} +%m%d-%H%M 2>/dev/null || echo "?")
   VER=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$DIR/package.json','utf8')).version)" 2>/dev/null || echo "?")
-  echo "[status] wechat-agent v${VER} (build ${BUILD})"
+  echo "[status] wechat-agent v${VER} (${BUILD})"
 
   if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
     PID=$(cat "$PIDFILE")
@@ -109,10 +109,8 @@ start|--bg)
   # 清理超过1天的媒体缓存
   find /tmp/weixin-agent/media -type f -mtime +1 -delete 2>/dev/null
 
-  # build 号来自程序目录（共享）
-  BUILD_FILE="$DIR/.build"
-  BUILD=$(cat "$BUILD_FILE" 2>/dev/null || echo "?")
-  echo "[start] build $BUILD"
+  BUILD=$(stat -c %Y "$DIR"/*.mjs "$DIR"/*.sh 2>/dev/null | sort -rn | head -1 | xargs -I{} date -d @{} +%m%d-%H%M 2>/dev/null || echo "?")
+  echo "[start] ${BUILD}"
 
   # 启动 weixin-acp（在 home 目录下运行，避免权限问题）
   cd "$HOME"

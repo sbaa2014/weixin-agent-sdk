@@ -542,7 +542,7 @@ async function withBrowser(fn) {
   let browser;
   try {
     browser = await puppeteer.default.launch({
-      headless: "shell",
+      headless: true,
       args: [
         "--no-sandbox",
         "--disable-gpu",
@@ -551,6 +551,7 @@ async function withBrowser(fn) {
         "--disable-extensions",
         "--disable-background-networking",
         "--single-process",
+        "--disable-blink-features=AutomationControlled",
       ],
     });
     return await fn(browser);
@@ -695,12 +696,20 @@ async function browserFetch(url, { expectImage = false } = {}) {
         await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36");
         const client = await page.createCDPSession();
         await client.send("Fetch.enable", { patterns: [{ urlPattern: "*", requestStage: "Response" }] });
+        let firstStatus = 0;
         const bodyPromise = new Promise((resolve) => {
           client.on("Fetch.requestPaused", async (evt) => {
             try {
               const status = evt.responseStatusCode || 0;
               const ct = (evt.responseHeaders || []).find(h => h.name.toLowerCase() === "content-type")?.value || "";
-              if (status >= 400) {
+              if (status >= 400 && !firstStatus) {
+                firstStatus = status;
+                await client.send("Fetch.continueResponse", { requestId: evt.requestId });
+                // Don't resolve yet — let Cloudflare JS challenge redirect
+                return;
+              }
+              if (status >= 400 && firstStatus) {
+                // Second 4xx+ means it's a real error, not a challenge
                 await client.send("Fetch.continueResponse", { requestId: evt.requestId });
                 resolve({ error: `http${status}` });
                 return;
@@ -726,9 +735,21 @@ async function browserFetch(url, { expectImage = false } = {}) {
           });
         });
         const waitUntil = expectImage ? "load" : "networkidle2";
-        page.goto(url, { timeout: 15000, waitUntil }).catch(() => {});
-        const result = await Promise.race([bodyPromise, new Promise((_, rej) => setTimeout(() => rej(new Error("cdp timeout")), 18000))]);
+        page.goto(url, { timeout: 20000, waitUntil }).catch(() => {});
+        const result = await Promise.race([bodyPromise, new Promise((_, rej) => setTimeout(() => rej(new Error("cdp timeout")), 22000))]);
         await client.detach();
+        // If CDP resolved with error but page may have loaded via JS redirect, check page content
+        if (result.error && firstStatus === 403 && !expectImage) {
+          try { await page.waitForNetworkIdle({ timeout: 8000 }); } catch {}
+          const finalUrl = page.url();
+          const html = await page.content();
+          if (html.length > 2000 && !html.includes("Just a moment") && !html.includes("Checking your browser")) {
+            log.info(`browser.fetch.cf-bypass url=${finalUrl.slice(0, 60)} len=${html.length}`);
+            return { html };
+          }
+          log.warn(`browser.fetch.fail http${firstStatus} url=${url.slice(0, 80)}`);
+          return null;
+        }
         if (result.error) {
           log.warn(`browser.fetch.fail ${result.error} url=${url.slice(0, 80)}`);
           return null;
@@ -745,7 +766,7 @@ async function browserFetch(url, { expectImage = false } = {}) {
         }
         return null;
       }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("browser timeout 25s")), 25000)),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("browser timeout 30s")), 30000)),
     ]);
   } catch (e) { log.error("browser.fetch.error", e.message); return null; }
 }
@@ -1260,11 +1281,13 @@ class MyAgent {
     if (needsFinal) {
       thinkState.phase = "生成总结";
       const safeMessages = sanitizeHistory(session.history);
+      safeMessages.push({ role: "user", content: "请根据以上搜索和抓取到的信息，直接用中文给出完整回答。即使信息不完整，也要基于已有内容尽力回答，不要留空。" });
       log.info(`reply.final.call safeLen=${safeMessages.length}`);
+      const finalSystemPrompt = SYSTEM_PROMPT + "\n\n【重要】现在你必须根据前面工具调用获得的信息，生成一段对用户有帮助的中文回复。禁止返回空内容。如果信息不足以完整回答，就基于已有信息给出部分回答并说明哪些信息暂时找不到。";
       const finalResp = await this.client.messages.create({
         model: DEFAULT_MODEL,
         max_tokens: 2048,
-        system: SYSTEM_PROMPT,
+        system: finalSystemPrompt,
         messages: safeMessages,
       }, { timeout: 90_000 });
       log.info(`reply.final.done blocks=${finalResp.content.length} stop=${finalResp.stop_reason}`);
