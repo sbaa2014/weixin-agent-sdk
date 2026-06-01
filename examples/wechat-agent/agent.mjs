@@ -689,6 +689,75 @@ function toolRunCode(language, code) {
   }
 }
 
+// Returns { text } on success, or { error } with a user-facing message.
+function extractWordText(base64Data) {
+  const buf = Buffer.from(base64Data, "base64");
+  const head = buf.slice(0, 8);
+  const isZip = head[0] === 0x50 && head[1] === 0x4b && head[2] === 0x03 && head[3] === 0x04;
+  const isOle2 = head[0] === 0xd0 && head[1] === 0xcf && head[2] === 0x11 && head[3] === 0xe0;
+  log.info(`word.parse bytes=${buf.length} head=${head.toString("hex")} kind=${isZip ? "zip" : isOle2 ? "ole2" : "unknown"}`);
+
+  const ext = isZip ? ".docx" : ".doc";
+  const tmpFile = path.join(os.tmpdir(), `word-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
+  let keepForDiag = false;
+  try {
+    fs.writeFileSync(tmpFile, buf);
+
+    if (isZip) {
+      try {
+        const xml = execSync(`unzip -p ${JSON.stringify(tmpFile)} word/document.xml`, {
+          encoding: "utf-8", maxBuffer: 16 * 1024 * 1024, timeout: 10000,
+        });
+        const text = xml
+          .replace(/<w:tab[^>]*\/>/g, "\t")
+          .replace(/<w:br[^>]*\/>/g, "\n")
+          .replace(/<\/w:p>/g, "\n")
+          .replace(/<[^>]+>/g, "")
+          .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+          .replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+          .replace(/\n{3,}/g, "\n\n")
+          .trim();
+        return { text };
+      } catch (err) {
+        keepForDiag = true;
+        log.error(`docx.unzip.fail file=${tmpFile}`, err.message);
+        return { error: "解析 .docx 失败（文件可能损坏或格式异常）" };
+      }
+    }
+
+    if (isOle2) {
+      // Detect DRM/IRM-encrypted Office documents (OLE2 stream names are UTF-16LE)
+      const probe = buf.slice(0, 8192).toString("latin1").replace(/\x00/g, "");
+      if (probe.includes("EncryptedPackage") || probe.includes("DRMEncrypted")) {
+        return { error: "这份文档已加密（DRM/IRM 保护），无法读取内容。请发送未加密的版本。" };
+      }
+      try {
+        const text = execSync(`catdoc -d utf-8 ${JSON.stringify(tmpFile)}`, {
+          encoding: "utf-8", maxBuffer: 16 * 1024 * 1024, timeout: 10000,
+        }).replace(/\n{3,}/g, "\n\n").trim();
+        if (!text) {
+          keepForDiag = true;
+          log.error(`doc.catdoc.empty file=${tmpFile}`);
+          return { error: "解析 .doc 失败（catdoc 无输出，可能是加密或格式异常）" };
+        }
+        return { text };
+      } catch (err) {
+        keepForDiag = true;
+        log.error(`doc.catdoc.fail file=${tmpFile}`, err.message);
+        return { error: "解析 .doc 失败" };
+      }
+    }
+
+    keepForDiag = true;
+    log.error(`word.unknown.format file=${tmpFile} head=${head.toString("hex")}`);
+    return { error: "无法识别的 Word 文档格式" };
+  } finally {
+    if (!keepForDiag) {
+      try { fs.unlinkSync(tmpFile); } catch {}
+    }
+  }
+}
+
 const IMAGE_EXTS = /\.(jpg|jpeg|png|gif|webp|bmp)(\?|$)/i;
 
 function validateImage(buf) {
@@ -980,7 +1049,8 @@ const SYSTEM_PROMPT_BASE = `你是一个强大的 AI 助手，运行在微信上
 - 如果用户要求计算或验证，使用代码执行
 - 如果用户需要翻译或编程，可以委派给专门的子 agent
 - 不确定的信息要明确说明
-- 搜索效率：尽量在 3-5 次搜索内收集足够信息就开始回答。如果前几次搜索已经有相关结果，不要反复换关键词重复搜索，直接基于已有信息回答即可。信息不完整时也应给出部分回答并说明局限`;
+- 搜索效率：尽量在 3-5 次搜索内收集足够信息就开始回答。如果前几次搜索已经有相关结果，不要反复换关键词重复搜索，直接基于已有信息回答即可。信息不完整时也应给出部分回答并说明局限
+- **重要**：工具的输出（如 run_code 的 print 内容）用户看不到！用户只能看到你直接回复的文字。所以如果用户要求看代码、看结果，你必须把代码/结果直接写在你的回复文本中，而不是仅仅用 print() 输出然后说"以上是代码"。run_code 工具仅用于计算和验证，其输出只有你自己能看到。`;
 
 const CUSTOM_PROMPT_FILE = path.join(os.homedir(), ".openclaw", "wechat-agent", "system-prompt.md");
 
@@ -1549,6 +1619,7 @@ class MyAgent {
         const mime = res.mimeType || "application/octet-stream";
         const data = res.blob || res.text;
         if (!data) continue;
+        const name = res.uri?.split("/").pop() || "file";
         if (mime === "application/pdf") {
           blocks.push({
             type: "document",
@@ -1556,10 +1627,18 @@ class MyAgent {
           });
         } else if (mime.startsWith("text/") || mime === "application/json") {
           const text = res.text || Buffer.from(data, "base64").toString("utf-8");
-          const name = res.uri?.split("/").pop() || "file";
           blocks.push({ type: "text", text: `[文件: ${name}]\n${text}` });
+        } else if (mime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                  || mime === "application/msword"
+                  || name.toLowerCase().endsWith(".docx")
+                  || name.toLowerCase().endsWith(".doc")) {
+          const result = extractWordText(data);
+          if (result.text) {
+            blocks.push({ type: "text", text: `[文件: ${name}]\n${result.text}` });
+          } else {
+            blocks.push({ type: "text", text: `[收到文件: ${name}] ${result.error}` });
+          }
         } else {
-          const name = res.uri?.split("/").pop() || "file";
           blocks.push({ type: "text", text: `[收到文件: ${name} (${mime})，暂不支持此格式的内容解析]` });
         }
       }

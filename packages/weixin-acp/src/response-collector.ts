@@ -6,7 +6,7 @@ import path from "node:path";
 import type { ChatResponse } from "weixin-agent-sdk";
 import type { SessionNotification } from "@agentclientprotocol/sdk";
 
-const ACP_MEDIA_OUT_DIR = path.join(os.tmpdir(), "weixin-agent/media/acp-out");
+const ACP_MEDIA_OUT_DIR = path.join(os.tmpdir(), `weixin-agent-${os.userInfo().username}/media/acp-out`);
 
 /**
  * Collects sessionUpdate notifications for a single prompt round-trip

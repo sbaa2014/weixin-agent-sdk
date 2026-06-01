@@ -31,8 +31,8 @@ export function markdownToPlainText(text: string): string {
   result = result
     .replace(/\*\*(.+?)\*\*/g, "$1")
     .replace(/\*(.+?)\*/g, "$1")
-    .replace(/__(.+?)__/g, "$1")
-    .replace(/_(.+?)_/g, "$1")
+    .replace(/(?<!\w)__(.+?)__(?!\w)/g, "$1")
+    .replace(/(?<!\w)_(.+?)_(?!\w)/g, "$1")
     .replace(/~~(.+?)~~/g, "$1")
     .replace(/`(.+?)`/g, "$1");
   return result;

@@ -107,14 +107,20 @@ start|--bg)
   set -e
 
   # 清理超过1天的媒体缓存
-  find /tmp/weixin-agent/media -type f -mtime +1 -delete 2>/dev/null
+  find "/tmp/weixin-agent-$(whoami)/media" -type f -mtime +1 -delete 2>/dev/null
 
   BUILD=$(stat -c %Y "$DIR"/*.mjs "$DIR"/*.sh 2>/dev/null | sort -rn | head -1 | xargs -I{} date -d @{} +%m%d-%H%M 2>/dev/null || echo "?")
   echo "[start] ${BUILD}"
 
   # 启动 weixin-acp（在 home 目录下运行，避免权限问题）
   cd "$HOME"
-  npx weixin-acp start -- node "$DIR/agent.mjs" >>"$LOG" 2>&1 &
+  LOCAL_ACP="$DIR/../../packages/weixin-acp/dist/main.mjs"
+  if [ -f "$LOCAL_ACP" ]; then
+    echo "[start] 使用本地 weixin-acp: $LOCAL_ACP"
+    node "$LOCAL_ACP" start -- node "$DIR/agent.mjs" >>"$LOG" 2>&1 &
+  else
+    npx weixin-acp start -- node "$DIR/agent.mjs" >>"$LOG" 2>&1 &
+  fi
   BRIDGE_PID=$!
   echo "$BRIDGE_PID" > "$PIDFILE"
 

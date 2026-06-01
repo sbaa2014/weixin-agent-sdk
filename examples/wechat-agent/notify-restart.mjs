@@ -178,7 +178,15 @@ if (!contextToken) {
 }
 
 const now = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
-const model = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514";
+// 与 agent.mjs 一致：env > settings.json > 默认
+function loadModelFromSettings() {
+  try {
+    const settingsPath = path.join(HOME, ".claude", "settings.json");
+    const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+    return settings?.env?.ANTHROPIC_MODEL;
+  } catch { return null; }
+}
+const model = process.env.ANTHROPIC_MODEL || loadModelFromSettings() || "claude-sonnet-4-20250514";
 const nodeVer = process.version;
 const pid = process.ppid || process.pid;
 const mem = Math.round(process.memoryUsage().rss / 1024 / 1024);
