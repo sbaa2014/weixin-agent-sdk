@@ -1144,7 +1144,23 @@ class MyAgent {
         return { stopReason: "cancelled" };
       }
       log.error(`prompt.error sid=${params.sessionId.slice(0, 8)}`, err.message);
-      await this.sendText(params.sessionId, `处理出错: ${err.message}`);
+      // 给用户更清晰的错误信息：API 错误 (status + 上游 message) vs 其他异常
+      const status = err.status || err.statusCode;
+      const apiMsg = err.error?.error?.message || err.error?.message;
+      let userMsg;
+      if (status && apiMsg) {
+        userMsg = `⚠️ API 错误 ${status}\n${apiMsg.slice(0, 300)}`;
+        if (status === 503 || status === 502 || status === 504) {
+          userMsg += `\n\n（上游服务临时不可用，请稍后重试）`;
+        } else if (status === 429) {
+          userMsg += `\n\n（请求被限流，请稍后重试）`;
+        } else if (status === 401 || status === 403) {
+          userMsg += `\n\n（鉴权失败，请联系管理员）`;
+        }
+      } else {
+        userMsg = `⚠️ 处理出错: ${err.message?.slice(0, 300) || err}`;
+      }
+      await this.sendText(params.sessionId, userMsg);
     }
 
     session.pendingPrompt = null;
@@ -1276,6 +1292,21 @@ class MyAgent {
         turnTokensIn += response.usage.input_tokens || 0;
         turnTokensOut += response.usage.output_tokens || 0;
         turnLLMCalls++;
+      }
+
+      // 兜底：模型拒绝 / 空响应，必须显式提示用户，否则微信端表现为静默
+      if (response.stop_reason === "refusal") {
+        log.error(`llm.refusal sid=${sessionId.slice(0, 8)} usage=${JSON.stringify(response.usage)}`);
+        const out = response.usage?.output_tokens ?? 0;
+        await this.sendText(sessionId, `⚠️ 模型拒绝回复（stop_reason=refusal, output=${out} tokens）\n通常是 safety classifier 触发。请换个说法，或发 /clear 清空会话上下文重试。`);
+        session.history.pop(); // 把这条触发 refusal 的 user 消息移出，避免污染后续上下文
+        break;
+      }
+      if (response.content.length === 0) {
+        log.error(`llm.empty sid=${sessionId.slice(0, 8)} stop=${response.stop_reason} usage=${JSON.stringify(response.usage)}`);
+        await this.sendText(sessionId, `⚠️ 模型返回空内容（stop_reason=${response.stop_reason}）。请稍后重试，或发 /clear 重开会话。`);
+        session.history.pop();
+        break;
       }
 
       let hasToolUse = false;
