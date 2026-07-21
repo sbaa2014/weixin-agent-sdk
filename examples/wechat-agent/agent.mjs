@@ -1193,10 +1193,16 @@ class MyAgent {
 
     // 如果有进行中的 aws login，把这条消息当作 authorization code 喂进子进程
     if (session.pendingLogin && userText) {
-      const code = userText.trim();
-      log.info(`eks_login.code.received sid=${sessionId.slice(0, 8)} len=${code.length}`);
+      // 容忍用户复制粘贴时把命令前缀一起带上 (e.g. "/eks_login <code>", "code: <code>")
+      let code = userText.trim()
+        .replace(/^\/(el|eks_login|aws_login)\s+/i, "")
+        .replace(/^code\s*[:：]\s*/i, "")
+        .replace(/^["'`]+|["'`]+$/g, "")
+        .trim();
+      log.info(`eks_login.code.received sid=${sessionId.slice(0, 8)} len=${code.length} raw_len=${userText.length}`);
       try {
         session.pendingLogin.proc.stdin.write(code + "\n");
+        await this.sendText(sessionId, `已提交 authorization code（${code.length} 字符），等待 CLI 完成...`);
       } catch (err) {
         log.error(`eks_login.stdin.fail sid=${sessionId.slice(0, 8)}`, err.message);
         await this.sendText(sessionId, `⚠️ 写入 code 失败: ${err.message}`);
@@ -1648,13 +1654,32 @@ class MyAgent {
       return true;
     }
 
-    if (cmd === "/eks_login" || cmd === "/aws_login") {
+    // 启动 / 提交 code: /el, /eks_login, /aws_login (后两者作为 alias 保留)
+    const eksMatch = text.trim().match(/^\/(el|eks_login|aws_login)(?:\s+([\s\S]+))?$/i);
+    if (eksMatch && !text.trim().match(/^\/(el|eks_login|aws_login)_cancel/i)) {
+      const code = eksMatch[2]?.trim();
+      const session = this.sessions.get(sessionId);
+      if (code && session?.pendingLogin) {
+        log.info(`cmd.eks_login.code_inline sid=${sid} len=${code.length}`);
+        try {
+          session.pendingLogin.proc.stdin.write(code + "\n");
+          await this.sendText(sessionId, `已提交 authorization code（${code.length} 字符），等待 CLI 完成...`);
+        } catch (err) {
+          log.error(`eks_login.stdin.fail sid=${sid}`, err.message);
+          await this.sendText(sessionId, `⚠️ 写入 code 失败: ${err.message}`);
+        }
+        return true;
+      }
+      if (code && !session?.pendingLogin) {
+        await this.sendText(sessionId, "当前没有进行中的 aws login。先发 /eks_login（不带 code）启动登录流程，URL 到达后再回发 code。");
+        return true;
+      }
       await this.startEksLogin(sessionId);
       log.info(`cmd.eks_login sid=${sid}`);
       return true;
     }
 
-    if (cmd === "/eks_login_cancel" || cmd === "/aws_login_cancel") {
+    if (cmd === "/el_cancel" || cmd === "/eks_login_cancel" || cmd === "/aws_login_cancel") {
       const session = this.sessions.get(sessionId);
       if (session?.pendingLogin) {
         try { session.pendingLogin.proc.kill("SIGTERM"); } catch {}
@@ -1676,8 +1701,8 @@ class MyAgent {
         "  /usage (用量) — 今日 Token 消耗",
         "  /clear (清空) — 清除当前对话记录",
         "  /resume (继续) — 继续上次未完成的任务",
-        "  /eks_login — 启动 aws login --remote，把验证 code 回发给我",
-        "  /eks_login_cancel — 取消进行中的 aws login",
+        "  /el — 启动 aws login --remote，把验证 code 回发给我（别名: /eks_login）",
+        "  /el_cancel — 取消进行中的 aws login",
         "  /help (帮助) — 显示此帮助",
         "",
         "直接发消息即可对话，支持搜索、计算、翻译、编程。",
@@ -1713,47 +1738,57 @@ class MyAgent {
 
     log.info(`eks_login.start sid=${sid} pid=${proc.pid}`);
     session.pendingLogin = { proc, startTime: Date.now(), urlSent: false, output: "" };
+    // 立即在 ACP 流内回个反馈，URL 之后通过 sendWechatDirect 异步送达
+    await this.sendText(sessionId, `🔐 正在启动 aws login --remote (pid=${proc.pid})...\n几秒后会推送验证 URL。`);
 
     const TIMEOUT_MS = 5 * 60 * 1000;
     const timer = setTimeout(() => {
       if (session.pendingLogin?.proc === proc) {
         log.error(`eks_login.timeout sid=${sid}`);
         try { proc.kill("SIGTERM"); } catch {}
-        this.sendText(sessionId, "⚠️ aws login 超时（5 分钟）。已取消，请重新发送 /eks_login。");
+        sendWechatDirect("⚠️ aws login 超时（5 分钟）。已取消，请重新发送 /eks_login。");
         session.pendingLogin = null;
       }
     }, TIMEOUT_MS);
 
+    const trySendUrl = async () => {
+      if (!session.pendingLogin || session.pendingLogin.urlSent) return;
+      // 等 URL 行完整：URL 后接 \n，或 CLI 已经输出 "authorization code" 提示
+      const haveTerminator =
+        /(https?:\/\/\S+)\s*\n/.test(stdoutBuf) ||
+        /authorization code/i.test(stdoutBuf + stderrBuf);
+      if (!haveTerminator) return;
+      const m = stdoutBuf.match(/(https?:\/\/\S+)/);
+      if (!m) return;
+      session.pendingLogin.urlSent = true;
+      // ACP prompt 已 return，必须用 sendWechatDirect 直推（不走 ACP collector）
+      await sendWechatDirect([
+        "🔐 AWS 登录已启动",
+        "",
+        "1️⃣ 在浏览器中打开下面的链接：",
+        m[1],
+        "",
+        "2️⃣ 完成登录后，把页面显示的 authorization code 直接回发给我",
+        "",
+        "（5 分钟超时；中途可发 /eks_login_cancel 取消）",
+      ].join("\n"));
+    };
+
     let stdoutBuf = "";
+    let stderrBuf = "";
     proc.stdout.on("data", async (chunk) => {
       const s = chunk.toString("utf-8");
       stdoutBuf += s;
       session.pendingLogin && (session.pendingLogin.output += s);
       log.info(`eks_login.stdout sid=${sid} chunk=${JSON.stringify(s.slice(0, 200))}`);
-      // 检测验证 URL（只发一次）
-      if (session.pendingLogin && !session.pendingLogin.urlSent) {
-        const m = stdoutBuf.match(/(https?:\/\/\S+)/);
-        if (m) {
-          session.pendingLogin.urlSent = true;
-          await this.sendText(sessionId, [
-            "🔐 AWS 登录已启动",
-            "",
-            "1️⃣ 在浏览器中打开下面的链接：",
-            m[1],
-            "",
-            "2️⃣ 完成登录后，把页面显示的 authorization code 直接回发给我",
-            "",
-            "（5 分钟超时；中途可发 /eks_login_cancel 取消）",
-          ].join("\n"));
-        }
-      }
+      await trySendUrl();
     });
 
-    let stderrBuf = "";
-    proc.stderr.on("data", (chunk) => {
+    proc.stderr.on("data", async (chunk) => {
       const s = chunk.toString("utf-8");
       stderrBuf += s;
       log.info(`eks_login.stderr sid=${sid} chunk=${JSON.stringify(s.slice(0, 200))}`);
+      await trySendUrl();
     });
 
     proc.on("error", async (err) => {
@@ -1761,7 +1796,7 @@ class MyAgent {
       clearTimeout(timer);
       if (session.pendingLogin?.proc === proc) {
         session.pendingLogin = null;
-        await this.sendText(sessionId, `⚠️ aws login 进程错误: ${err.message}`);
+        await sendWechatDirect(`⚠️ aws login 进程错误: ${err.message}`);
       }
     });
 
@@ -1772,9 +1807,9 @@ class MyAgent {
       session.pendingLogin = null;
       const tail = (stdoutBuf + stderrBuf).trim().split("\n").slice(-6).join("\n");
       if (code === 0) {
-        await this.sendText(sessionId, `✅ aws login 成功\n\n${tail}`);
+        await sendWechatDirect(`✅ aws login 成功\n\n${tail}`);
       } else {
-        await this.sendText(sessionId, `❌ aws login 失败 (exit=${code}${signal ? `, signal=${signal}` : ""})\n\n${tail || "(无输出)"}`);
+        await sendWechatDirect(`❌ aws login 失败 (exit=${code}${signal ? `, signal=${signal}` : ""})\n\n${tail || "(无输出)"}`);
       }
     });
   }
