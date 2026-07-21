@@ -107,7 +107,7 @@ start|--bg)
   set -e
 
   # 清理超过1天的媒体缓存
-  find "/tmp/weixin-agent-$(whoami)/media" -type f -mtime +1 -delete 2>/dev/null
+  find "/tmp/weixin-agent-$(whoami)/media" -type f -mtime +1 -delete 2>/dev/null || true
 
   BUILD=$(stat -c %Y "$DIR"/*.mjs "$DIR"/*.sh 2>/dev/null | sort -rn | head -1 | xargs -I{} date -d @{} +%m%d-%H%M 2>/dev/null || echo "?")
   echo "[start] ${BUILD}"
