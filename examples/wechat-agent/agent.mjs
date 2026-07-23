@@ -334,7 +334,23 @@ function loadSession() {
   return null;
 }
 
+function stripBrokenThinking(history) {
+  // Thinking blocks require a valid signature string to be replayed to the API.
+  // A model/backend switch (or an interrupted stream) can leave signature=null,
+  // which the API rejects with a 400 on the next turn — drop those blocks.
+  return (history || []).map(msg => {
+    if (!Array.isArray(msg.content)) return msg;
+    const filtered = msg.content.filter(b => {
+      if (b && b.type === "thinking") return typeof b.signature === "string" && b.signature.length > 0;
+      return true;
+    });
+    if (filtered.length === msg.content.length) return msg;
+    return { ...msg, content: filtered };
+  }).filter(msg => !Array.isArray(msg.content) || msg.content.length > 0);
+}
+
 function sanitizeHistory(history) {
+  history = stripBrokenThinking(history);
   // Pass 1: pair tool_use with tool_result, strip broken pairs
   const paired = [];
   let i = 0;
