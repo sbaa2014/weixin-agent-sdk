@@ -54,6 +54,28 @@ const ANTHROPIC_API_KEY =
   process.env.ANTHROPIC_API_KEY ||
   "dummy";
 const DEFAULT_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514";
+// 运行期可切换的当前模型；重启后恢复为 DEFAULT_MODEL
+let ACTIVE_MODEL = DEFAULT_MODEL;
+
+// ─── Model Catalog ─────────────────────────────────────────────────────────
+
+// 网关同时代理非对话模型 (embedding/tts/图像/语音等)，这些不能用于 messages.create
+const NON_CHAT_MODEL_PATTERN = /embed|-tts$|^tts-|whisper|transcribe|realtime|diffusion|image|audio|^mock-llm$/i;
+let modelsCache = { list: null, ts: 0 };
+const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
+
+async function fetchAvailableModels(force = false) {
+  const now = Date.now();
+  if (!force && modelsCache.list && now - modelsCache.ts < MODELS_CACHE_TTL_MS) return modelsCache.list;
+  const res = await fetch(`${ANTHROPIC_BASE_URL}/v1/models`, {
+    headers: { "x-api-key": ANTHROPIC_API_KEY, Authorization: `Bearer ${ANTHROPIC_API_KEY}` },
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  const ids = (data.data || []).map((m) => m.id).filter((id) => !NON_CHAT_MODEL_PATTERN.test(id)).sort();
+  modelsCache = { list: ids, ts: now };
+  return ids;
+}
 
 // ─── WeChat Direct Send (bypass ACP for real-time notifications) ──────────
 
@@ -1002,7 +1024,7 @@ async function toolDelegateAgent(client, agentType, task) {
   if (!systemPrompt) return `未知的 agent 类型: ${agentType}`;
   try {
     const resp = await client.messages.create({
-      model: DEFAULT_MODEL,
+      model: ACTIVE_MODEL,
       max_tokens: 2048,
       system: systemPrompt,
       messages: [{ role: "user", content: task }],
@@ -1314,7 +1336,7 @@ class MyAgent {
       try {
         const safeMessages = sanitizeHistory(session.history);
         response = await this.client.messages.create({
-          model: DEFAULT_MODEL,
+          model: ACTIVE_MODEL,
           max_tokens: 4096,
           system: SYSTEM_PROMPT,
           tools: TOOL_DEFINITIONS,
@@ -1353,7 +1375,7 @@ class MyAgent {
             try {
               const t1 = Date.now();
               const r2 = await this.client.messages.create({
-                model: DEFAULT_MODEL,
+                model: ACTIVE_MODEL,
                 max_tokens: 4096,
                 system: SYSTEM_PROMPT,
                 tools: TOOL_DEFINITIONS,
@@ -1491,7 +1513,7 @@ class MyAgent {
       log.info(`reply.final.call safeLen=${safeMessages.length}`);
       const finalSystemPrompt = SYSTEM_PROMPT + "\n\n【重要】现在你必须根据前面工具调用获得的信息，生成一段对用户有帮助的中文回复。禁止返回空内容。如果信息不足以完整回答，就基于已有信息给出部分回答并说明哪些信息暂时找不到。";
       const finalResp = await this.client.messages.create({
-        model: DEFAULT_MODEL,
+        model: ACTIVE_MODEL,
         max_tokens: 2048,
         system: finalSystemPrompt,
         messages: safeMessages,
@@ -1584,7 +1606,7 @@ class MyAgent {
       const uptime = this.formatUptime(Date.now() - AGENT_START_TIME.getTime());
       const info = [
         `wechat-agent v${AGENT_VERSION} (build ${AGENT_BUILD})`,
-        `模型: ${DEFAULT_MODEL}`,
+        `模型: ${ACTIVE_MODEL}${ACTIVE_MODEL !== DEFAULT_MODEL ? ` (默认 ${DEFAULT_MODEL})` : ""}`,
         `Node: ${process.version}`,
         `启动: ${AGENT_START_TIME.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}`,
         `运行: ${uptime}`,
@@ -1670,6 +1692,41 @@ class MyAgent {
       return true;
     }
 
+    if (cmd === "/models" || cmd === "模型列表") {
+      try {
+        const ids = await fetchAvailableModels();
+        await this.sendText(sessionId, `可用模型 (${ids.length}):\n${ids.join("、")}`);
+        log.info(`cmd.models sid=${sid} count=${ids.length}`);
+      } catch (err) {
+        await this.sendText(sessionId, `获取模型列表失败: ${err.message}`);
+        log.error(`cmd.models.error sid=${sid}`, err.message);
+      }
+      return true;
+    }
+
+    const modelMatch = text.trim().match(/^\/model(?:\s+(\S+))?$/i);
+    if (modelMatch) {
+      const name = modelMatch[1];
+      if (!name) {
+        await this.sendText(
+          sessionId,
+          `当前模型: ${ACTIVE_MODEL}\n默认模型 (重启后恢复): ${DEFAULT_MODEL}\n切换: /model <模型名>\n查看可选: /models`
+        );
+        log.info(`cmd.model.show sid=${sid} active=${ACTIVE_MODEL}`);
+        return true;
+      }
+      let warning = "";
+      try {
+        const ids = await fetchAvailableModels();
+        if (!ids.includes(name)) warning = `\n⚠️ 该名称不在网关模型列表中，若调用失败请用 /models 核对`;
+      } catch {}
+      const prev = ACTIVE_MODEL;
+      ACTIVE_MODEL = name;
+      log.info(`cmd.model.switch sid=${sid} from=${prev} to=${name}`);
+      await this.sendText(sessionId, `模型已切换: ${prev} → ${name}${warning}\n(仅本次进程运行期间生效，重启恢复为 ${DEFAULT_MODEL})`);
+      return true;
+    }
+
     // 启动 / 提交 code: /el, /eks_login, /aws_login (后两者作为 alias 保留)
     const eksMatch = text.trim().match(/^\/(el|eks_login|aws_login)(?:\s+([\s\S]+))?$/i);
     if (eksMatch && !text.trim().match(/^\/(el|eks_login|aws_login)_cancel/i)) {
@@ -1715,6 +1772,8 @@ class MyAgent {
         "  /status (状态) — 运行状态和资源",
         "  /tools (工具) — 查看可用工具列表",
         "  /usage (用量) — 今日 Token 消耗",
+        "  /model — 查看当前模型；/model <名称> 实时切换",
+        "  /models (模型列表) — 列出网关可用模型",
         "  /clear (清空) — 清除当前对话记录",
         "  /resume (继续) — 继续上次未完成的任务",
         "  /el — 启动 aws login --remote，把验证 code 回发给我（别名: /eks_login）",
