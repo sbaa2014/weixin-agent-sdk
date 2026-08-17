@@ -356,6 +356,26 @@ function loadSession() {
   return null;
 }
 
+function stripProviderSpecificFields(history) {
+  // tool_use blocks carry provider_specific_fields set by the original
+  // (e.g. Vertex/AWS) backend. Replaying them through a different backend
+  // (e.g. claude-sonnet-5 via Anthropic-direct) is rejected as
+  // "Extra inputs are not permitted" — drop the field entirely.
+  return (history || []).map(msg => {
+    if (!Array.isArray(msg.content)) return msg;
+    let changed = false;
+    const content = msg.content.map(b => {
+      if (b && typeof b === "object" && "provider_specific_fields" in b) {
+        const { provider_specific_fields, ...rest } = b;
+        changed = true;
+        return rest;
+      }
+      return b;
+    });
+    return changed ? { ...msg, content } : msg;
+  });
+}
+
 function stripBrokenThinking(history) {
   // Thinking blocks require a valid signature string to be replayed to the API.
   // A model/backend switch (or an interrupted stream) can leave signature=null,
@@ -373,6 +393,7 @@ function stripBrokenThinking(history) {
 
 function sanitizeHistory(history) {
   history = stripBrokenThinking(history);
+  history = stripProviderSpecificFields(history);
   // Pass 1: pair tool_use with tool_result, strip broken pairs
   const paired = [];
   let i = 0;
