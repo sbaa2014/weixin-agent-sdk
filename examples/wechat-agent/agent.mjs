@@ -15,13 +15,14 @@
  */
 
 import { Readable, Writable } from "node:stream";
-import { execSync, spawn } from "node:child_process";
+import { execFileSync, execSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import nodeCrypto from "node:crypto";
 import * as acp from "@agentclientprotocol/sdk";
 import Anthropic from "@anthropic-ai/sdk";
+import { sendWeixinMediaFile } from "../../packages/sdk/dist/index.mjs";
 
 // ─── Version & Build ───────────────────────────────────────────────────────
 
@@ -83,7 +84,12 @@ function loadWechatAccount() {
   const dir = path.join(os.homedir(), ".openclaw", "openclaw-weixin", "accounts");
   try {
     const files = fs.readdirSync(dir).filter(f => f.endsWith(".json") && !f.includes(".sync"));
-    for (const f of files) {
+    const requested = process.env.WECHAT_ACCOUNT_ID?.trim();
+    const ordered = requested
+      ? [ `${requested}.json`, ...files.filter(f => f !== `${requested}.json`) ]
+      : files;
+    for (const f of ordered) {
+      if (!files.includes(f)) continue;
       const data = JSON.parse(fs.readFileSync(path.join(dir, f), "utf-8"));
       if (data.token && data.baseUrl && data.userId) return data;
     }
@@ -92,12 +98,14 @@ function loadWechatAccount() {
 }
 
 const WECHAT_ACCOUNT = loadWechatAccount();
+const WECHAT_TARGET_USER_ID = process.env.WECHAT_USER_ID?.trim() || WECHAT_ACCOUNT?.userId;
 let wechatContextToken = null;
 
 // Load cached context token
 try {
   const cache = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".openclaw", "wechat-agent", "last-context.json"), "utf-8"));
-  const entry = cache[WECHAT_ACCOUNT?.userId];
+  const entry = (process.env.WECHAT_ACCOUNT_ID && cache[process.env.WECHAT_ACCOUNT_ID]?.[WECHAT_TARGET_USER_ID])
+    || cache[WECHAT_TARGET_USER_ID];
   if (entry?.contextToken) wechatContextToken = entry.contextToken;
 } catch {}
 
@@ -156,6 +164,60 @@ function aesEcbPaddedSize(plaintextSize) {
   return Math.ceil((plaintextSize + 1) / 16) * 16;
 }
 
+function pdfEscapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;");
+}
+
+function markdownInlineHtml(value) {
+  return pdfEscapeHtml(value)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2">$1</a>');
+}
+
+// Small dependency-free Markdown renderer for PDF output. The source .md is
+// retained as the canonical document; this only creates a local print HTML.
+function markdownToPdfHtml(markdown, title) {
+  const lines = String(markdown).replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  let inCode = false;
+  let listType = null;
+  let paragraph = [];
+  const closeList = () => { if (listType) { out.push(`</${listType}>`); listType = null; } };
+  const flushParagraph = () => {
+    if (paragraph.length) { out.push(`<p>${paragraph.map(markdownInlineHtml).join("<br>")}</p>`); paragraph = []; }
+  };
+  for (const line of lines) {
+    if (/^```/.test(line)) {
+      flushParagraph(); closeList();
+      if (inCode) { out.push("</code></pre>"); inCode = false; }
+      else { out.push("<pre><code>"); inCode = true; }
+      continue;
+    }
+    if (inCode) { out.push(pdfEscapeHtml(line) + "\n"); continue; }
+    if (!line.trim()) { flushParagraph(); closeList(); continue; }
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) { flushParagraph(); closeList(); const level = heading[1].length; out.push(`<h${level}>${markdownInlineHtml(heading[2])}</h${level}>`); continue; }
+    if (/^---+$/.test(line.trim())) { flushParagraph(); closeList(); out.push("<hr>"); continue; }
+    const bullet = line.match(/^\s*[-*+]\s+(.+)$/);
+    const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (bullet || ordered) {
+      flushParagraph(); const nextType = bullet ? "ul" : "ol";
+      if (listType !== nextType) { closeList(); listType = nextType; out.push(`<${listType}>`); }
+      out.push(`<li>${markdownInlineHtml((bullet || ordered)[1])}</li>`); continue;
+    }
+    closeList(); paragraph.push(line);
+  }
+  flushParagraph(); closeList();
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${pdfEscapeHtml(title)}</title>
+<style>@page{size:A4;margin:18mm 16mm}body{font-family:"Noto Sans CJK SC","Microsoft YaHei",Arial,sans-serif;color:#222;line-height:1.65;font-size:12pt}h1{font-size:25pt;border-bottom:2px solid #333;padding-bottom:5mm}h2{font-size:18pt;margin-top:9mm;border-bottom:1px solid #aaa}h3{font-size:14pt}p{margin:4mm 0}li{margin:1.5mm 0}code{font-family:monospace;background:#f1f1f1;padding:1px 4px}pre{background:#f5f5f5;padding:4mm;white-space:pre-wrap}a{color:#0645ad}hr{border:0;border-top:1px solid #aaa;margin:7mm 0}</style></head><body>${out.join("\n")}</body></html>`;
+}
+
 function wechatApiHeaders() {
   const uin = Buffer.from(String(nodeCrypto.randomBytes(4).readUInt32BE(0)), "utf-8").toString("base64");
   return {
@@ -169,7 +231,7 @@ function wechatApiHeaders() {
 async function sendWechatImageDirect(imageBuf, mimeType) {
   if (!WECHAT_ACCOUNT || !wechatContextToken) return false;
   const baseUrl = WECHAT_ACCOUNT.baseUrl.replace(/\/+$/, "");
-  const toUserId = WECHAT_ACCOUNT.userId;
+  const toUserId = WECHAT_TARGET_USER_ID;
 
   const rawsize = imageBuf.length;
   const rawfilemd5 = nodeCrypto.createHash("md5").update(imageBuf).digest("hex");
@@ -244,6 +306,105 @@ async function sendWechatImageDirect(imageBuf, mimeType) {
   });
   const sendText = await sendResp.text();
   return sendResp.ok;
+}
+
+// ─── WeChat Direct File Send ──────────────────────────────────────────────
+
+async function sendWechatFileDirect(filePath, caption = "") {
+  if (!WECHAT_ACCOUNT || !WECHAT_TARGET_USER_ID || !wechatContextToken) return false;
+  // Reuse the SDK's tested file pipeline. It selects media_type=3 for files,
+  // encodes the AES key in the format expected by file_item, and sends the
+  // caption/file as separate messages.
+  const sdkResult = await sendWeixinMediaFile({
+    filePath,
+    to: WECHAT_TARGET_USER_ID,
+    text: caption,
+    opts: {
+      baseUrl: WECHAT_ACCOUNT.baseUrl,
+      token: WECHAT_ACCOUNT.token,
+      contextToken: wechatContextToken,
+    },
+    cdnBaseUrl: WECHAT_ACCOUNT.cdnBaseUrl || CDN_BASE_URL,
+  });
+  if (sdkResult?.messageId) return true;
+
+  const fileBuf = fs.readFileSync(filePath);
+  const baseUrl = WECHAT_ACCOUNT.baseUrl.replace(/\/+$/, "");
+  const fileName = path.basename(filePath);
+  const rawsize = fileBuf.length;
+  const filesize = aesEcbPaddedSize(rawsize);
+  const rawfilemd5 = nodeCrypto.createHash("md5").update(fileBuf).digest("hex");
+  const filekey = nodeCrypto.randomBytes(16).toString("hex");
+  const aeskey = nodeCrypto.randomBytes(16);
+
+  const uploadResp = await fetch(`${baseUrl}/ilink/bot/getuploadurl`, {
+    method: "POST",
+    headers: wechatApiHeaders(),
+    body: JSON.stringify({
+      // UploadMediaType.FILE = 3 (4 is VOICE and makes PDF attachments
+      // appear as downloadable but fail to open in the WeChat client).
+      filekey, media_type: 3, to_user_id: WECHAT_TARGET_USER_ID,
+      rawsize, rawfilemd5, filesize, no_need_thumb: true,
+      aeskey: aeskey.toString("hex"), base_info: { channel_version: "1.0.2" },
+    }),
+  });
+  if (!uploadResp.ok) throw new Error(`getUploadUrl ${uploadResp.status}`);
+  const uploadData = await uploadResp.json();
+  const ciphertext = aesEcbEncrypt(fileBuf, aeskey);
+  const uploadFullUrl = uploadData.upload_full_url?.trim();
+  const uploadParam = uploadData.upload_param;
+  const cdnUrl = uploadFullUrl || (uploadParam
+    ? `${CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(uploadParam)}&filekey=${encodeURIComponent(filekey)}`
+    : null);
+  if (!cdnUrl) throw new Error("getUploadUrl: no upload URL returned");
+
+  let downloadParam;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const cdnResp = await fetch(cdnUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: new Uint8Array(ciphertext),
+    });
+    if (cdnResp.status >= 400 && cdnResp.status < 500) throw new Error(`CDN upload ${cdnResp.status}`);
+    if (cdnResp.status === 200) {
+      downloadParam = cdnResp.headers.get("x-encrypted-param");
+      if (downloadParam) break;
+    }
+    if (attempt === 3) throw new Error("CDN upload failed after 3 attempts");
+  }
+
+  // WeChat expects each media item in its own sendmessage request. Sending
+  // the caption and file in one item_list can show a download entry that
+  // cannot be opened by the client.
+  const sendItem = async (item, label) => {
+    const sendResp = await fetch(`${baseUrl}/ilink/bot/sendmessage`, {
+      method: "POST",
+      headers: wechatApiHeaders(),
+      body: JSON.stringify({
+        msg: {
+          from_user_id: "", to_user_id: WECHAT_TARGET_USER_ID,
+          client_id: `file-${label}-${nodeCrypto.randomUUID()}`,
+          message_type: 2, message_state: 2,
+          context_token: wechatContextToken,
+          item_list: [item],
+        },
+        base_info: { channel_version: "1.0.2" },
+      }),
+    });
+    const responseText = await sendResp.text();
+    if (!sendResp.ok) throw new Error(`send file ${sendResp.status}: ${responseText.slice(0, 200)}`);
+  };
+  if (caption) await sendItem({ type: 1, text_item: { text: caption } }, "caption");
+  await sendItem({ type: 4, file_item: {
+    media: {
+      encrypt_query_param: downloadParam,
+      aes_key: Buffer.from(aeskey.toString("hex")).toString("base64"),
+      encrypt_type: 1,
+    },
+    file_name: fileName,
+    len: String(rawsize),
+  } }, "attachment");
+  return true;
 }
 
 // ─── Logger ────────────────────────────────────────────────────────────────
@@ -564,6 +725,18 @@ const TOOL_DEFINITIONS = [
         url: { type: "string", description: "要抓取的真实URL（必须来自搜索结果或网页，不要自己构造）" },
       },
       required: ["url"],
+    },
+  },
+  {
+    name: "create_pdf",
+    description: "先将内容整理成 Markdown，再使用 Marp CLI 转成 PDF 并直接发送到当前微信会话。适合行程、报告、清单和演示文稿。不要直接调用 Chromium 转 PDF。",
+    input_schema: {
+      type: "object",
+      properties: {
+        markdown: { type: "string", description: "完整 Markdown 文档；如需分页，使用单独一行的 ---" },
+        filename: { type: "string", description: "PDF 文件名，可选，例如 itinerary.pdf" },
+      },
+      required: ["markdown"],
     },
   },
   {
@@ -1032,6 +1205,69 @@ async function toolFetchUrl(url, sessionId, connection) {
   }
 }
 
+// ─── Markdown → PDF ───────────────────────────────────────────────────────
+
+async function toolCreatePdf(markdown, filename = "document.pdf") {
+  if (typeof markdown !== "string" || !markdown.trim()) {
+    return "PDF 生成失败: markdown 不能为空";
+  }
+
+  const safeName = String(filename || "document.pdf")
+    .replace(/[\\/:*?"<>|\x00-\x1f]/g, "-")
+    .replace(/\.pdf$/i, "")
+    .slice(0, 100) || "document";
+  const workDir = path.join(os.tmpdir(), `wechat-agent-${os.userInfo().username}`, "pdf");
+  const repoDir = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
+  fs.mkdirSync(workDir, { recursive: true });
+  const id = nodeCrypto.randomUUID();
+  const mdPath = path.join(workDir, `${id}.md`);
+  const htmlPath = path.join(workDir, `${id}.html`);
+  const pdfPath = path.join(workDir, `${safeName}-${id}.pdf`);
+
+  fs.writeFileSync(mdPath, markdown, "utf8");
+  fs.writeFileSync(htmlPath, markdownToPdfHtml(markdown, safeName), "utf8");
+  try {
+    // Use the known-good local Chromium directly. This avoids npx downloads,
+    // Marp's bundled browser and repeated shell probing inside the ACP turn.
+    execFileSync("/usr/bin/chromium-browser", [
+      "--headless", "--no-sandbox", "--disable-gpu", "--disable-crash-reporter",
+      "--disable-dev-shm-usage", "--no-pdf-header-footer",
+      `--user-data-dir=${path.join(workDir, `chrome-${id}`)}`,
+      `--print-to-pdf=${pdfPath}`,
+      `file://${htmlPath}`,
+    ], {
+      cwd: workDir,
+      // The system Chromium shipped on this host links libopenmpt against
+      // mpg123_param2, which is absent from the installed libmpg123 ABI.
+      // Keep using the known-good system browser, with the local compatibility
+      // shims injected into the browser and any helper it starts.
+      env: {
+        ...process.env,
+        CHROME_PATH: "/usr/bin/chromium-browser",
+        LD_PRELOAD: [
+          path.join(repoDir, "mpg123-shim.so"),
+          path.join(repoDir, "mpg123-param2-shim.so"),
+          process.env.LD_PRELOAD,
+        ].filter(Boolean).join(":"),
+      },
+      timeout: 35_000,
+      maxBuffer: 2 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (!fs.existsSync(pdfPath)) throw new Error("Marp 未生成 PDF 文件");
+    const sent = await sendWechatFileDirect(pdfPath, `已生成 PDF：${safeName}.pdf`);
+    if (!sent) return "PDF 已生成，但当前微信会话没有可用的发送凭据";
+    return `[已发送PDF到微信] ${safeName}.pdf (${Math.round(fs.statSync(pdfPath).size / 1024)}KB)`;
+  } catch (err) {
+    const detail = err?.stderr?.toString?.().trim() || err?.message || String(err);
+    return `PDF 生成失败: ${detail.slice(0, 500)}`;
+  } finally {
+    try { fs.unlinkSync(mdPath); } catch {}
+    try { fs.unlinkSync(htmlPath); } catch {}
+    try { fs.unlinkSync(pdfPath); } catch {}
+  }
+}
+
 // ─── Sub-Agent Prompts ─────────────────────────────────────────────────────
 
 const SUB_AGENT_PROMPTS = {
@@ -1092,7 +1328,8 @@ const SYSTEM_PROMPT_BASE = `你是一个强大的 AI 助手，运行在微信上
 1. **联网搜索** (web_search) — 搜索最新信息、新闻、知识
 2. **代码执行** (run_code) — 运行 Python/Node.js/Bash 代码来计算或验证
 3. **网页抓取/发图片** (fetch_url) — 获取网页内容；如果 URL 是图片（.jpg/.png/.gif/.webp），会自动下载并发送到微信聊天中
-4. **子Agent委派** (delegate_agent) — 将专业任务委派给编程/翻译/分析专家
+4. **生成并发送 PDF** (create_pdf) — 先整理成 Markdown，再生成 PDF 并直接发送到当前微信会话
+5. **子Agent委派** (delegate_agent) — 将专业任务委派给编程/翻译/分析专家
 
 重要：你可以发送图片！当你找到图片 URL 时，直接用 fetch_url 工具抓取该图片 URL，系统会自动将图片发送到微信。不要说"无法发送图片"。
 图片搜索技巧：
@@ -1109,6 +1346,7 @@ const SYSTEM_PROMPT_BASE = `你是一个强大的 AI 助手，运行在微信上
 - 如果用户的问题需要最新信息（新闻、天气、股价等），主动使用搜索工具
 - 如果用户要求计算或验证，使用代码执行
 - 如果用户需要翻译或编程，可以委派给专门的子 agent
+- 如果用户要求制作、导出、发送或查找 PDF，必须调用 create_pdf；不要只在工作区生成文件、返回本地路径，或直接调用 Chromium。create_pdf 成功后会自动把附件发送到当前微信会话
 - 不确定的信息要明确说明
 - 搜索效率：尽量在 3-5 次搜索内收集足够信息就开始回答。如果前几次搜索已经有相关结果，不要反复换关键词重复搜索，直接基于已有信息回答即可。信息不完整时也应给出部分回答并说明局限
 - **重要**：工具的输出（如 run_code 的 print 内容）用户看不到！用户只能看到你直接回复的文字。所以如果用户要求看代码、看结果，你必须把代码/结果直接写在你的回复文本中，而不是仅仅用 print() 输出然后说"以上是代码"。run_code 工具仅用于计算和验证，其输出只有你自己能看到。`;
@@ -2020,11 +2258,46 @@ class MyAgent {
   }
 }
 
+// ─── Exports for the Codex MCP bridge ─────────────────────────────────────
+
+// Keep the original tool implementations reusable when this file is loaded by
+// codex-tools.mjs. The ACP server is started only when agent.mjs is executed
+// directly, so importing this module no longer creates a second ACP endpoint.
+export const MCP_TOOL_DEFINITIONS = TOOL_DEFINITIONS
+  // delegate_agent used the old Anthropic client to start a second model call;
+  // Codex is now the model backend, so exposing that stale implementation
+  // would only produce a misleading tool that cannot run.
+  .filter((tool) => tool.name !== "delegate_agent")
+  .map((tool) => ({
+  name: tool.name,
+  description: tool.description,
+  inputSchema: tool.input_schema,
+  }));
+
+export async function callToolFromMcp(name, input) {
+  switch (name) {
+    case "web_search":
+      return await toolWebSearch(input?.query || "");
+    case "run_code":
+      return toolRunCode(input?.language, input?.code || "");
+    case "fetch_url":
+      // Image downloads use the same direct WeChat CDN path as the original
+      // agent. Text pages are returned to Codex as normal tool output.
+      return await toolFetchUrl(input?.url || "", undefined, undefined);
+    case "create_pdf":
+      return await toolCreatePdf(input?.markdown || "", input?.filename || "document.pdf");
+    default:
+      throw new Error(`未知工具: ${name}`);
+  }
+}
+
 // ─── Bootstrap ─────────────────────────────────────────────────────────────
 
-log.info("agent.start", { pid: process.pid, node: process.version });
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)) {
+  log.info("agent.start", { pid: process.pid, node: process.version });
 
-const input = Writable.toWeb(process.stdout);
-const output = Readable.toWeb(process.stdin);
-const stream = acp.ndJsonStream(input, output);
-new acp.AgentSideConnection((conn) => new MyAgent(conn), stream);
+  const input = Writable.toWeb(process.stdout);
+  const output = Readable.toWeb(process.stdin);
+  const stream = acp.ndJsonStream(input, output);
+  new acp.AgentSideConnection((conn) => new MyAgent(conn), stream);
+}

@@ -31,6 +31,7 @@ export type LoginOptions = {
   baseUrl?: string;
   /** Log callback (defaults to console.log). */
   log?: (msg: string) => void;
+  onQrCode?: (qrcodeUrl: string) => void | Promise<void>;
 };
 
 export type StartOptions = {
@@ -40,6 +41,16 @@ export type StartOptions = {
   abortSignal?: AbortSignal;
   /** Log callback (defaults to console.log). */
   log?: (msg: string) => void;
+  /** Start a new Weixin login flow from an admin command. */
+  onAddUser?: (params: {
+    accountId: string;
+    to: string;
+    contextToken?: string;
+    baseUrl: string;
+    cdnBaseUrl: string;
+    token?: string;
+  }) => Promise<void>;
+  onAccountConnected?: (accountId: string) => void | Promise<void>;
 };
 
 /**
@@ -120,9 +131,7 @@ export function logout(opts?: { log?: (msg: string) => void }): void {
  */
 export function isLoggedIn(): boolean {
   const ids = listWeixinAccountIds();
-  if (ids.length === 0) return false;
-  const account = resolveWeixinAccount(ids[0]);
-  return account.configured;
+  return ids.some((id) => resolveWeixinAccount(id).configured);
 }
 
 /**
@@ -275,6 +284,7 @@ export function start(agent: Agent, opts?: StartOptions): Bot {
     accountId: account.accountId,
     agent,
     abortSignal: opts?.abortSignal,
+    onAddUser: opts?.onAddUser,
     log,
   });
 

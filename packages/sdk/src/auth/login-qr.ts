@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 
+import QRCode from "qrcode";
 import { apiGetFetch } from "../api/api.js";
 import { logger } from "../util/logger.js";
 import { redactToken } from "../util/redact.js";
@@ -109,6 +110,16 @@ export type WeixinQrWaitResult = {
   message: string;
 };
 
+/** Render login QR payload as a PNG for delivery through WeChat. */
+export async function renderWeixinQrCodePng(content: string): Promise<Buffer> {
+  return QRCode.toBuffer(content, {
+    type: "png",
+    width: 640,
+    margin: 4,
+    errorCorrectionLevel: "M",
+  });
+}
+
 export async function startWeixinLoginWithQr(opts: {
   verbose?: boolean;
   timeoutMs?: number;
@@ -172,6 +183,7 @@ export async function waitForWeixinLogin(opts: {
   sessionKey: string;
   apiBaseUrl: string;
   botType?: string;
+  onQrCode?: (qrcodeUrl: string) => void | Promise<void>;
 }): Promise<WeixinQrWaitResult> {
   let activeLogin = activeLogins.get(opts.sessionKey);
 
@@ -253,9 +265,11 @@ export async function waitForWeixinLogin(opts: {
               qrterm.default.generate(qrResponse.qrcode_img_content, { small: true });
               process.stdout.write(`如果二维码未能成功展示，请用浏览器打开以下链接扫码：\n`);
               process.stdout.write(`${qrResponse.qrcode_img_content}\n`);
+              await opts.onQrCode?.(qrResponse.qrcode_img_content);
             } catch {
               process.stdout.write(`二维码未加载成功，请用浏览器打开以下链接扫码：\n`);
               process.stdout.write(`${qrResponse.qrcode_img_content}\n`);
+              await opts.onQrCode?.(qrResponse.qrcode_img_content);
             }
           } catch (refreshErr) {
             logger.error(`waitForWeixinLogin: failed to refresh QR code: ${String(refreshErr)}`);

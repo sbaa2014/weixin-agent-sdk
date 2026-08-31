@@ -11,12 +11,15 @@ import { downloadRemoteImageToTemp } from "../cdn/upload.js";
 import { downloadMediaFromItem } from "../media/media-download.js";
 import { getExtensionFromMime } from "../media/mime.js";
 import { logger } from "../util/logger.js";
+import { loadWeixinAccount } from "../auth/accounts.js";
 
 import { setContextToken, bodyFromItemList, isMediaItem } from "./inbound.js";
+import { readFrameworkAllowFromList } from "../auth/pairing.js";
 import { sendWeixinErrorNotice } from "./error-notice.js";
 import { sendWeixinMediaFile } from "./send-media.js";
 import { markdownToPlainText, sendMessageWeixin } from "./send.js";
 import { handleSlashCommand } from "./slash-commands.js";
+import { isDebugMode } from "./debug-mode.js";
 
 const MEDIA_TEMP_DIR = path.join(os.tmpdir(), `weixin-agent-${os.userInfo().username}/media`);
 
@@ -52,6 +55,14 @@ export type ProcessMessageDeps = {
   typingTicket?: string;
   log: (msg: string) => void;
   errLog: (msg: string) => void;
+  onAddUser?: (params: {
+    accountId: string;
+    to: string;
+    contextToken?: string;
+    baseUrl: string;
+    cdnBaseUrl: string;
+    token?: string;
+  }) => Promise<void>;
 };
 
 /** Extract raw text from item_list (for slash command detection). */
@@ -101,6 +112,15 @@ function findMediaItem(itemList?: MessageItem[]): MessageItem | undefined {
   return refItem?.ref_msg?.message_item ?? undefined;
 }
 
+function isAdminUser(accountId: string, userId: string): boolean {
+  const configured = process.env.WECHAT_ADMIN_USER_IDS
+    ?.split(",")
+    .map((id) => id.trim())
+    .filter(Boolean) ?? [];
+  if (configured.includes(userId)) return true;
+  return loadWeixinAccount(accountId)?.userId === userId;
+}
+
 /**
  * Process a single inbound message:
  *   slash command check → download media → call agent → send reply.
@@ -111,10 +131,32 @@ export async function processOneMessage(
 ): Promise<void> {
   const receivedAt = Date.now();
   const textBody = extractTextBody(full.item_list);
+  const conversationId = full.from_user_id ?? "";
+  const senderIsAdmin = isAdminUser(deps.accountId, conversationId);
+
+  // An empty allowFrom file keeps the historical open mode. Once an
+  // administrator uses /add-user, the file is populated and access becomes
+  // restricted to the account owner/admins and explicitly added users.
+  const allowFrom = readFrameworkAllowFromList(deps.accountId);
+  const isWhoAmI = /^\/whoami(?:\s|$)/i.test(textBody.trim());
+  if (allowFrom.length > 0 && !senderIsAdmin && !allowFrom.includes(conversationId) && !isWhoAmI) {
+    deps.log(`[weixin] unauthorized user blocked account=${deps.accountId} user=${conversationId}`);
+    if (full.context_token) {
+      try {
+        await sendMessageWeixin({
+          to: conversationId,
+          text: "⛔ 你还没有被授权使用此机器人。请发送 /whoami 获取用户 ID，并让管理员执行 /add-user <用户ID>。",
+          opts: { baseUrl: deps.baseUrl, token: deps.token, contextToken: full.context_token },
+        });
+      } catch {
+        // Best-effort rejection notice.
+      }
+    }
+    return;
+  }
 
   // --- Slash commands ---
   if (textBody.startsWith("/")) {
-    const conversationId = full.from_user_id ?? "";
     const slashResult = await handleSlashCommand(
       textBody,
       {
@@ -126,6 +168,9 @@ export async function processOneMessage(
         log: deps.log,
         errLog: deps.errLog,
         onClear: () => deps.agent.clearSession?.(conversationId),
+        getDebugInfo: () => deps.agent.getDebugInfo?.(conversationId) ?? "当前 agent 未提供诊断信息",
+        isAdmin: senderIsAdmin,
+        onAddUser: deps.onAddUser,
       },
       receivedAt,
       full.create_time_ms,
@@ -242,6 +287,22 @@ export async function processOneMessage(
         text: markdownToPlainText(response.text),
         opts: { baseUrl: deps.baseUrl, token: deps.token, contextToken },
       });
+    }
+
+    if (isDebugMode(deps.accountId) && contextToken) {
+      try {
+        await sendMessageWeixin({
+          to,
+          text: [
+            "⏱ Agent 调试耗时",
+            `├ 微信收到→开始处理: ${Math.max(0, receivedAt - (full.create_time_ms ?? receivedAt))}ms`,
+            `└ Agent处理→回复完成: ${Date.now() - receivedAt}ms`,
+          ].join("\n"),
+          opts: { baseUrl: deps.baseUrl, token: deps.token, contextToken },
+        });
+      } catch {
+        // The debug timing message is best-effort and must not fail the reply.
+      }
     }
   } catch (err) {
     logger.error(`processOneMessage: agent or send failed: ${err instanceof Error ? err.stack ?? err.message : JSON.stringify(err)}`);

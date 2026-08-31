@@ -59,12 +59,14 @@ export function listIndexedWeixinAccountIds(): string[] {
   }
 }
 
-/** Register accountId as the sole account in the persistent index. */
+/** Register accountId in the persistent account index without dropping others. */
 export function registerWeixinAccountId(accountId: string): void {
   const dir = resolveWeixinStateDir();
   fs.mkdirSync(dir, { recursive: true });
 
-  fs.writeFileSync(resolveAccountIndexPath(), JSON.stringify([accountId], null, 2), "utf-8");
+  const ids = listIndexedWeixinAccountIds();
+  if (!ids.includes(accountId)) ids.push(accountId);
+  fs.writeFileSync(resolveAccountIndexPath(), JSON.stringify(ids, null, 2), "utf-8");
 }
 
 // ---------------------------------------------------------------------------

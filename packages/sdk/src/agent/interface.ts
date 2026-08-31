@@ -11,6 +11,8 @@ export interface Agent {
   chat(request: ChatRequest): Promise<ChatResponse>;
   /** Clear/reset the session for a given conversation. */
   clearSession?(conversationId: string): void;
+  /** Return lightweight diagnostic information without calling the model. */
+  getDebugInfo?(conversationId: string): string | Promise<string>;
 }
 
 export interface ChatRequest {

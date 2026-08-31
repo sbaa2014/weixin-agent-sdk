@@ -22,6 +22,7 @@
     "node": ">=22"
   },
   "dependencies": {
+    "qrcode": "1.5.4",
     "qrcode-terminal": "0.12.0"
   },
   "scripts": {
@@ -32,6 +33,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/qrcode": "1.5.5",
     "tsdown": "^0.21.0",
     "typescript": "^5.8.0"
   }

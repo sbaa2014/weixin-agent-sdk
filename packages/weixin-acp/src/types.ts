@@ -7,6 +7,8 @@ export type AcpAgentOptions = {
   env?: Record<string, string>;
   /** Working directory for the subprocess and ACP sessions */
   cwd?: string;
+  /** WeChat account handled by this agent; used for multi-tenant routing. */
+  accountId?: string;
   /** Prompt timeout in milliseconds (default: 120_000) */
   promptTimeoutMs?: number;
 };

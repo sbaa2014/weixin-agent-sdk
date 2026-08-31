@@ -24,10 +24,19 @@ function contextTokenKey(accountId: string, userId: string): string {
 
 const CONTEXT_CACHE_PATH = path.join(os.homedir(), ".openclaw", "wechat-agent", "last-context.json");
 
-function persistContextToken(userId: string, token: string): void {
+function persistContextToken(accountId: string, userId: string, token: string): void {
   try {
     fs.mkdirSync(path.dirname(CONTEXT_CACHE_PATH), { recursive: true });
-    const data = { [userId]: { contextToken: token, date: new Date().toISOString().slice(0, 10) } };
+    let data: Record<string, Record<string, { contextToken: string; date: string }>> = {};
+    try {
+      const parsed = JSON.parse(fs.readFileSync(CONTEXT_CACHE_PATH, "utf-8"));
+      if (parsed && typeof parsed === "object") data = parsed;
+    } catch {}
+    if (!data[accountId] || typeof data[accountId] !== "object") data[accountId] = {};
+    data[accountId][userId] = {
+      contextToken: token,
+      date: new Date().toISOString().slice(0, 10),
+    };
     fs.writeFileSync(CONTEXT_CACHE_PATH, JSON.stringify(data), "utf-8");
   } catch {}
 }
@@ -37,7 +46,7 @@ export function setContextToken(accountId: string, userId: string, token: string
   const k = contextTokenKey(accountId, userId);
   logger.debug(`setContextToken: key=${k}`);
   contextTokenStore.set(k, token);
-  persistContextToken(userId, token);
+  persistContextToken(accountId, userId, token);
 }
 
 /** Retrieve the cached context token for a given account+user pair. */

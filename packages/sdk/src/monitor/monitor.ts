@@ -2,7 +2,7 @@ import type { Agent } from "../agent/interface.js";
 import { getUpdates } from "../api/api.js";
 import { WeixinConfigManager } from "../api/config-cache.js";
 import { SESSION_EXPIRED_ERRCODE, pauseSession, getRemainingPauseMs } from "../api/session-guard.js";
-import { processOneMessage } from "../messaging/process-message.js";
+import { processOneMessage, type ProcessMessageDeps } from "../messaging/process-message.js";
 import { getSyncBufFilePath, loadGetUpdatesBuf, saveGetUpdatesBuf } from "../storage/sync-buf.js";
 import { logger } from "../util/logger.js";
 import { redactBody } from "../util/redact.js";
@@ -20,6 +20,7 @@ export type MonitorWeixinOpts = {
   agent: Agent;
   abortSignal?: AbortSignal;
   longPollTimeoutMs?: number;
+  onAddUser?: ProcessMessageDeps["onAddUser"];
   log?: (msg: string) => void;
 };
 
@@ -132,6 +133,7 @@ export async function monitorWeixinProvider(opts: MonitorWeixinOpts): Promise<vo
           cdnBaseUrl,
           token,
           typingTicket: cachedConfig.typingTicket,
+          onAddUser: opts.onAddUser,
           log,
           errLog,
         });

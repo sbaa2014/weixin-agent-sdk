@@ -97,37 +97,40 @@ async function sendText(baseUrl, token, userId, contextToken, text) {
 
 // ─── 找 account 信息 ───────────────────────────────────────────────────────
 
-function findAccount() {
+function findAccounts() {
   const dir = path.join(HOME, ".openclaw", "openclaw-weixin", "accounts");
+  const accounts = [];
   try {
     const files = fs.readdirSync(dir).filter(f => f.endsWith(".json") && !f.includes(".sync"));
     for (const f of files) {
       const data = JSON.parse(fs.readFileSync(path.join(dir, f), "utf-8"));
-      if (data.token && data.baseUrl && data.userId) return data;
+      if (data.token && data.baseUrl && data.userId) {
+        accounts.push({ ...data, accountId: f.slice(0, -5) });
+      }
     }
-  } catch {}
-  return null;
+  } catch { /* ignore */ }
+  return accounts;
 }
 
 // ─── 找 get_updates_buf ───────────────────────────────────────────────────────
 
-function findSyncBuf() {
+function findSyncBuf(accountId) {
   const dir = path.join(HOME, ".openclaw", "openclaw-weixin", "accounts");
   try {
-    const files = fs.readdirSync(dir).filter(f => f.endsWith(".sync.json"));
-    for (const f of files) {
-      const data = JSON.parse(fs.readFileSync(path.join(dir, f), "utf-8"));
-      if (data.get_updates_buf) return data.get_updates_buf;
-    }
-  } catch {}
+    const file = path.join(dir, `${accountId}.sync.json`);
+    const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+    return data.get_updates_buf || null;
+  } catch { /* ignore */ }
   return null;
 }
 
 // ─── 找缓存的 context_token ──────────────────────────────────────────────────
 
-function findCachedContext(userId) {
+function findCachedContext(accountId, userId) {
   try {
     const data = JSON.parse(fs.readFileSync(CONTEXT_CACHE, "utf-8"));
+    if (data[accountId]?.[userId]?.contextToken) return data[accountId][userId].contextToken;
+    // Legacy single-account cache.
     if (data[userId]?.contextToken) return data[userId].contextToken;
   } catch {}
   return null;
@@ -135,100 +138,91 @@ function findCachedContext(userId) {
 
 // ─── 保存 context_token 到缓存 ───────────────────────────────────────────────
 
-function saveContextCache(userId, contextToken) {
+function saveContextCache(accountId, userId, contextToken) {
   try {
     fs.mkdirSync(path.dirname(CONTEXT_CACHE), { recursive: true });
-    const data = { [userId]: { contextToken, date: new Date().toISOString().slice(0, 10) } };
+    const data = {};
+    try {
+      const old = JSON.parse(fs.readFileSync(CONTEXT_CACHE, "utf-8"));
+      if (old && typeof old === "object") Object.assign(data, old);
+    } catch {}
+    if (!data[accountId] || typeof data[accountId] !== "object") data[accountId] = {};
+    data[accountId][userId] = { contextToken, date: new Date().toISOString().slice(0, 10) };
     fs.writeFileSync(CONTEXT_CACHE, JSON.stringify(data), "utf-8");
   } catch {}
 }
 
 // ─── Main ──────────────────────────────────────────────────────────────────
 
-const account = findAccount();
-if (!account) {
+const accounts = findAccounts();
+if (accounts.length === 0) {
   console.log("[notify] 未找到账号信息，跳过通知");
   process.exit(0);
 }
 
-// 1) 尝试 getUpdates 拿新 token
-const syncBuf = findSyncBuf();
-let contextToken = null;
-
-if (syncBuf) {
-  console.log("[notify] 尝试 getUpdates 获取 context_token...");
-  contextToken = await fetchContextToken(account.baseUrl, account.token, syncBuf);
-  if (contextToken) {
-    console.log("[notify] 从 getUpdates 获取到新 context_token");
-    saveContextCache(account.userId, contextToken);
-  }
-}
-
-// 2) 回退到缓存
-if (!contextToken) {
-  contextToken = findCachedContext(account.userId);
-  if (contextToken) {
-    console.log("[notify] 使用缓存的 context_token");
-  }
-}
-
-if (!contextToken) {
-  console.log("[notify] 未找到 context_token，跳过通知");
-  process.exit(0);
-}
-
 const now = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
-// 与 agent.mjs 一致：env > settings.json > 默认
-function loadModelFromSettings() {
+
+// Read the Codex model only; do not display the old Claude model setting.
+function loadConfiguredModel() {
+  if (process.env.CODEX_MODEL) return process.env.CODEX_MODEL;
   try {
-    const settingsPath = path.join(HOME, ".claude", "settings.json");
-    const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
-    return settings?.env?.ANTHROPIC_MODEL;
-  } catch { return null; }
+    const configPath = path.join(HOME, ".codex", "config.toml");
+    const config = fs.readFileSync(configPath, "utf-8");
+    return config.match(/^\s*model\s*=\s*["']([^"']+)["']/m)?.[1] ?? null;
+  } catch {
+    return null;
+  }
 }
-const model = process.env.ANTHROPIC_MODEL || loadModelFromSettings() || "claude-sonnet-4-20250514";
+
+const model = loadConfiguredModel() || "Codex（本机配置）";
 const nodeVer = process.version;
 const pid = process.ppid || process.pid;
 const mem = Math.round(process.memoryUsage().rss / 1024 / 1024);
 
-// 读取 session 状态
-const SESSIONS_FILE = path.join(HOME, ".openclaw", "wechat-agent", "sessions.json");
-let sessionStatus = "就绪，等待指令";
-try {
-  const raw = JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf-8"));
-  const s = raw.default;
-  if (s?.pendingText) {
-    const preview = s.pendingText.slice(0, 80) + (s.pendingText.length > 80 ? "..." : "");
-    sessionStatus = `有未完成的任务\n上次请求: ${preview}\n回复"继续"可恢复处理`;
-  } else if (s?.history?.length > 0) {
-    sessionStatus = `就绪，已恢复 ${s.history.length} 条对话记忆`;
+for (const account of accounts) {
+  // 1) 尝试从本账号 getUpdates 拿 context token
+  const syncBuf = findSyncBuf(account.accountId);
+  let contextToken = process.env.WECHAT_NOTIFY_CACHE_ONLY === "1"
+    ? null
+    : (syncBuf ? await fetchContextToken(account.baseUrl, account.token, syncBuf) : null);
+  if (contextToken) {
+    saveContextCache(account.accountId, account.userId, contextToken);
   }
-} catch {}
 
-const text = [
-  `wechat-agent v${PKG.version} (${BUILD}) 已启动`,
-  `模型: ${model}  时间: ${now}`,
-  ``,
-  `支持输入:`,
-  `  文字 — 直接发消息对话`,
-  `  图片 — 发图片即可识别/分析`,
-  `  文件 — 发送文档自动解读`,
-  ``,
-  `技能:`,
-  `  联网搜索 — 新闻、天气、实时信息`,
-  `  代码执行 — Python/Node.js/Bash`,
-  `  网页抓取 — 获取网页内容、下载图片`,
-  `  发送图片 — 找到图片 URL 自动发到聊天`,
-  `  专家委派 — 编程/翻译/数据分析`,
-  ``,
-  `命令: /help /status /tools /usage /clear`,
-  ``,
-  `${sessionStatus}`,
-].join("\n");
+  // 2) 回退到本账号缓存
+  if (!contextToken) contextToken = findCachedContext(account.accountId, account.userId);
+  if (!contextToken) {
+    console.log(`[notify] account=${account.accountId} 未找到 context_token，跳过`);
+    continue;
+  }
 
-try {
-  await sendText(account.baseUrl, account.token, account.userId, contextToken, text);
-  console.log(`[notify] 已发送重启通知 → ${account.userId.slice(0, 12)}...`);
-} catch (err) {
-  console.log(`[notify] 发送失败: ${err.message}`);
+  const text = [
+    `wechat-agent v${PKG.version} (${BUILD}) 已启动`,
+    `模型: ${model}  时间: ${now}`,
+    `Node: ${nodeVer}  PID: ${pid}  内存: ${mem}MB`,
+    `账号: ${account.accountId}`,
+    `会话: 本次启动使用新的 Codex 会话，不恢复旧版 Claude 对话`,
+    "",
+    "支持输入:",
+    "  文字 — 直接发消息对话",
+    "  图片 — 发图片即可识别/分析",
+    "  文件 — 发送文档自动解读",
+    "",
+    "技能:",
+    "  联网搜索 — 新闻、天气、实时信息",
+    "  代码执行 — Python/Node.js/Bash",
+    "  网页抓取 — 获取网页内容、下载图片",
+    "  发送图片 — 找到图片 URL 自动发到聊天",
+    "",
+    "状态: 就绪，等待消息（首条消息到达时创建 Codex session）",
+    "",
+    "命令: /help /status /tools /usage /clear",
+  ].join("\n");
+
+  try {
+    await sendText(account.baseUrl, account.token, account.userId, contextToken, text);
+    console.log(`[notify] 已发送重启通知 account=${account.accountId}`);
+  } catch (err) {
+    console.log(`[notify] 发送失败 account=${account.accountId}: ${err.message}`);
+  }
 }

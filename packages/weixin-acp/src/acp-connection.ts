@@ -35,7 +35,11 @@ export class AcpConnection {
 
   private onExit?: () => void;
 
-  constructor(private options: AcpAgentOptions, onExit?: () => void) {
+  constructor(
+    private options: AcpAgentOptions,
+    onExit?: () => void,
+    private canMutateSession?: (sessionId: SessionId) => boolean,
+  ) {
     this.onExit = onExit;
   }
 
@@ -45,6 +49,10 @@ export class AcpConnection {
 
   unregisterCollector(sessionId: SessionId): void {
     this.collectors.delete(sessionId);
+  }
+
+  getStatus(): { ready: boolean; pid: number | null } {
+    return { ready: this.ready, pid: this.process?.pid ?? null };
   }
 
   /**
@@ -101,6 +109,20 @@ export class AcpConnection {
         }
       },
       requestPermission: async (params) => {
+        const toolCall = params.toolCall;
+        const descriptor = `${toolCall.title ?? ""} ${JSON.stringify(toolCall.rawInput ?? "")}`;
+        const protectedOperation =
+          toolCall.kind === "edit" ||
+          toolCall.kind === "delete" ||
+          /(?:systemctl|service|start\.sh|restart|shutdown|reboot|pkill|kill\b|rm\s+-|apply_patch|tee\s|>\s*\/)/i.test(descriptor);
+        if (
+          protectedOperation &&
+          (process.env.WECHAT_ALLOW_SELF_DEBUG !== "1" || !this.canMutateSession?.(params.sessionId))
+        ) {
+          log(`permission denied by self-debug policy: ${descriptor.slice(0, 180)}`);
+          return { outcome: { outcome: "cancelled" as const } };
+        }
+
         const firstOption = params.options[0];
         log(
           `permission: auto-approved "${firstOption?.name ?? "allow"}" (${firstOption?.optionId ?? "unknown"})`,
