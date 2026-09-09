@@ -156,7 +156,7 @@ export async function processOneMessage(
   }
 
   // --- Slash commands ---
-  if (textBody.startsWith("/")) {
+  if (textBody.trim().startsWith("/") || /^(?:clear|清空|重置)$/i.test(textBody.trim())) {
     const slashResult = await handleSlashCommand(
       textBody,
       {

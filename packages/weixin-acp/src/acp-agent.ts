@@ -14,6 +14,25 @@ function log(msg: string) {
   console.log(`[acp] ${msg}`);
 }
 
+// A Codex app-server can keep an access token in memory for its whole
+// lifetime. Recycle it periodically so a refreshed auth.json is picked up
+// without requiring a full wechat-agent restart.
+const DEFAULT_CODEX_ACP_MAX_LIFETIME_MS = 12 * 60 * 60 * 1000;
+
+function getCodexAcpMaxLifetimeMs(): number {
+  const configured = Number.parseInt(process.env.CODEX_ACP_MAX_LIFETIME_MS ?? "", 10);
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : DEFAULT_CODEX_ACP_MAX_LIFETIME_MS;
+}
+
+function isAuthenticationFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /(?:401|unauthori[sz]ed|invalid token|token[^\n]{0,80}expired|expired[^\n]{0,80}token|authentication required|login required)/i.test(
+    message,
+  );
+}
+
 type WechatAccount = { token: string; baseUrl: string; userId: string };
 
 function loadWechatAccount(accountId?: string): WechatAccount | null {
@@ -125,6 +144,7 @@ export class AcpAgent implements Agent {
   private sessionModels = new Map<string, string>();
   private progressSequences = new Map<string, number>();
   private adminSessions = new Set<SessionId>();
+  private acpProcessStartedAt = 0;
   /**
    * Session namespace for this bridge process. ACP sessions are intentionally
    * never restored across process restarts; this id makes that boundary
@@ -162,7 +182,20 @@ export class AcpAgent implements Agent {
 
   async chat(request: ChatRequest): Promise<ChatResponse> {
     const startedAt = Date.now();
+    const maxLifetimeMs = getCodexAcpMaxLifetimeMs();
+    const status = this.connection.getStatus();
+    if (
+      status.ready &&
+      this.acpProcessStartedAt > 0 &&
+      Date.now() - this.acpProcessStartedAt >= maxLifetimeMs
+    ) {
+      log(`Codex ACP process reached ${Math.round(maxLifetimeMs / 3_600_000)}h lifetime, refreshing it`);
+      this.resetAcp("periodic credential refresh");
+    }
     const conn = await this.connection.ensureReady();
+    if (!status.ready || this.acpProcessStartedAt === 0) {
+      this.acpProcessStartedAt = Date.now();
+    }
 
     // Get or create an ACP session for this conversation
     const sessionId = await this.getOrCreateSession(request.conversationId, conn);
@@ -205,7 +238,10 @@ export class AcpAgent implements Agent {
     } catch (error) {
       if (error instanceof Error && error.message.startsWith("Codex 响应超时")) {
         log(`prompt timeout after ${promptTimeoutMs}ms, restarting ACP subprocess`);
-        this.connection.dispose();
+        this.resetAcp("prompt timeout");
+      } else if (isAuthenticationFailure(error)) {
+        log(`Codex authentication failure, refreshing ACP subprocess: ${String(error).slice(0, 240)}`);
+        this.resetAcp("authentication failure");
       }
       throw error;
     } finally {
@@ -287,7 +323,10 @@ export class AcpAgent implements Agent {
       this.connection.unregisterCollector(sessionId);
       this.adminSessions.delete(sessionId);
       this.sessions.delete(conversationId);
+      this.sessionModels.delete(conversationId);
       this.progressSequences.delete(conversationId);
+    } else {
+      log(`clear requested for conversation=${conversationId}, but no active ACP session was cached`);
     }
   }
 
@@ -295,10 +334,16 @@ export class AcpAgent implements Agent {
    * Kill the ACP subprocess and clean up all sessions.
    */
   dispose(): void {
+    this.resetAcp("agent disposed");
+  }
+
+  private resetAcp(reason: string): void {
+    log(`resetting ACP state (${reason})`);
     this.adminSessions.clear();
     this.sessionModels.clear();
     this.progressSequences.clear();
     this.sessions.clear();
+    this.acpProcessStartedAt = 0;
     this.connection.dispose();
   }
 

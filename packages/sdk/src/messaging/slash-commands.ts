@@ -94,7 +94,7 @@ export async function handleSlashCommand(
   eventTimestamp?: number,
 ): Promise<SlashCommandResult> {
   const trimmed = content.trim();
-  if (!trimmed.startsWith("/")) {
+  if (!trimmed.startsWith("/") && !/^(?:clear|清空|重置)$/i.test(trimmed)) {
     return { handled: false };
   }
 
@@ -123,7 +123,11 @@ export async function handleSlashCommand(
         );
         return { handled: true };
       }
-      case "/clear": {
+      case "/clear":
+      case "clear":
+      case "清空":
+      case "重置": {
+        ctx.log(`[weixin] clearing conversation=${ctx.to}`);
         ctx.onClear?.();
         await sendReply(ctx, "✅ 会话已清除，重新开始对话");
         return { handled: true };
