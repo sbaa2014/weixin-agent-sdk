@@ -239,9 +239,19 @@ export class AcpAgent implements Agent {
       if (error instanceof Error && error.message.startsWith("Codex 响应超时")) {
         log(`prompt timeout after ${promptTimeoutMs}ms, restarting ACP subprocess`);
         this.resetAcp("prompt timeout");
+        return {
+          text: [
+            "⚠️ 本次请求超时，Codex 会话已自动重启。",
+            `已等待 ${Math.round(promptTimeoutMs / 1000)} 秒仍未得到结果。`,
+            "如果你查询的是导入状态，通常是后端 StarRocks 查询变慢，并非 token 失效；请稍后重试。",
+          ].join("\n"),
+        };
       } else if (isAuthenticationFailure(error)) {
         log(`Codex authentication failure, refreshing ACP subprocess: ${String(error).slice(0, 240)}`);
         this.resetAcp("authentication failure");
+        return {
+          text: "⚠️ Codex 登录凭证已失效，ACP 会话已自动重启；请重新登录后再试。",
+        };
       }
       throw error;
     } finally {
@@ -379,10 +389,12 @@ function appendTurnSummary(
     "\n\n—— 本轮总结 ——",
     `用时: ${formatDuration(elapsedMs)}`,
     ...(model ? [`模型: ${model}`] : []),
-    `输入 token: ${formatTokenCount(usage?.inputTokens)}`,
-    `输出 token: ${formatTokenCount(usage?.outputTokens)}`,
-    ...(usage?.thoughtTokens != null ? [`思考 token: ${usage.thoughtTokens}`] : []),
-    `合计 token: ${formatTokenCount(usage?.totalTokens)}`,
+    `输入累计 token: ${formatTokenCount(usage?.inputTokens)}`,
+    `输出累计 token: ${formatTokenCount(usage?.outputTokens)}`,
+    `思考累计 token: ${formatTokenCount(usage?.thoughtTokens)}`,
+    `缓存读取 token: ${formatTokenCount(usage?.cachedReadTokens)}`,
+    `缓存写入 token: ${formatTokenCount(usage?.cachedWriteTokens)}`,
+    `ACP 总 token（会话累计）: ${formatTokenCount(usage?.totalTokens)}`,
   ].join("\n");
   return body ? `${body}${summary}` : summary.trimStart();
 }
