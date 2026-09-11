@@ -50,6 +50,8 @@ export type StartOptions = {
     cdnBaseUrl: string;
     token?: string;
   }) => Promise<void>;
+  /** Schedule a service restart after the administrator receives the reply. */
+  onRestart?: () => void | Promise<void>;
   onAccountConnected?: (accountId: string) => void | Promise<void>;
 };
 
@@ -285,6 +287,7 @@ export function start(agent: Agent, opts?: StartOptions): Bot {
     agent,
     abortSignal: opts?.abortSignal,
     onAddUser: opts?.onAddUser,
+    onRestart: opts?.onRestart,
     log,
   });
 

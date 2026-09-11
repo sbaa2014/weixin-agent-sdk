@@ -205,6 +205,18 @@ async function startAgents(acpCommand: string, acpArgs: string[] = []) {
       accountId,
       abortSignal: ac.signal,
       onAddUser: addUser,
+      onRestart: () => {
+        const unit = process.env.WECHAT_SYSTEMD_UNIT?.trim() || "wechat-agent-claude3.service";
+        if (!/^[A-Za-z0-9_.@:-]+$/.test(unit)) {
+          throw new Error("WECHAT_SYSTEMD_UNIT 配置无效");
+        }
+        console.log(`[weixin] scheduling self restart: ${unit}`);
+        const child = spawn("/usr/bin/sudo", ["-n", "systemctl", "restart", unit], {
+          detached: true,
+          stdio: "ignore",
+        });
+        child.unref();
+      },
       log: (msg) => console.log(`[${accountId}] ${msg}`),
     });
     runtimes.set(accountId, { agent, bot });

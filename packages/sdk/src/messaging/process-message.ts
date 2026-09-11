@@ -63,6 +63,8 @@ export type ProcessMessageDeps = {
     cdnBaseUrl: string;
     token?: string;
   }) => Promise<void>;
+  /** Schedule a service restart after the administrator receives the reply. */
+  onRestart?: () => void | Promise<void>;
 };
 
 /** Extract raw text from item_list (for slash command detection). */
@@ -168,6 +170,7 @@ export async function processOneMessage(
         log: deps.log,
         errLog: deps.errLog,
         onClear: () => deps.agent.clearSession?.(conversationId),
+        onRestart: deps.onRestart,
         getDebugInfo: () => deps.agent.getDebugInfo?.(conversationId) ?? "当前 agent 未提供诊断信息",
         isAdmin: senderIsAdmin,
         onAddUser: deps.onAddUser,

@@ -21,6 +21,7 @@ export type MonitorWeixinOpts = {
   abortSignal?: AbortSignal;
   longPollTimeoutMs?: number;
   onAddUser?: ProcessMessageDeps["onAddUser"];
+  onRestart?: ProcessMessageDeps["onRestart"];
   log?: (msg: string) => void;
 };
 
@@ -134,6 +135,7 @@ export async function monitorWeixinProvider(opts: MonitorWeixinOpts): Promise<vo
           token,
           typingTicket: cachedConfig.typingTicket,
           onAddUser: opts.onAddUser,
+          onRestart: opts.onRestart,
           log,
           errLog,
         });
