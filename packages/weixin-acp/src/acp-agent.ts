@@ -108,6 +108,7 @@ class ProgressNotifier {
     private conversationId: string,
     private readonly startedAt: number,
     private readonly sequence: number,
+    private readonly longTask: boolean,
   ) {}
 
   start(): void {
@@ -128,7 +129,9 @@ class ProgressNotifier {
     const sent = await sendProgressToWechat(
       this.accountId,
       this.conversationId,
-      `[#${String(this.sequence).padStart(3, "0")}] 处理中 | 已用时 ${duration}`,
+      this.longTask
+        ? `[#${String(this.sequence).padStart(3, "0")}] 长任务进行中 | 已用时 ${duration}；这是长任务，需要明确发送 /stop 或 /cancel 才会终止。`
+        : `[#${String(this.sequence).padStart(3, "0")}] 处理中 | 已用时 ${duration}`,
     );
     if (sent) log(`progress sent conversation=${this.conversationId} elapsed=${elapsed}s`);
   }
@@ -144,6 +147,8 @@ export class AcpAgent implements Agent {
   private sessionModels = new Map<string, string>();
   private progressSequences = new Map<string, number>();
   private adminSessions = new Set<SessionId>();
+  private activePrompts = new Map<string, { sessionId: SessionId; longTask: boolean }>();
+  private cancelledPrompts = new Set<string>();
   private acpProcessStartedAt = 0;
   /**
    * Session namespace for this bridge process. ACP sessions are intentionally
@@ -220,21 +225,27 @@ export class AcpAgent implements Agent {
       request.conversationId,
       startedAt,
       sequence,
+      Boolean(request.longTask),
     );
     this.connection.registerCollector(sessionId, collector);
+    this.activePrompts.set(request.conversationId, { sessionId, longTask: Boolean(request.longTask) });
     progress.start();
     let promptResult: { usage?: Usage | null } | undefined;
-    const promptTimeoutMs = this.options.promptTimeoutMs ?? 120_000;
+    const promptTimeoutMs = this.options.promptTimeoutMs ?? 600_000;
     let promptTimeout: ReturnType<typeof setTimeout> | undefined;
     try {
-      promptResult = await Promise.race([
-        conn.prompt({ sessionId, prompt: blocks }),
-        new Promise<never>((_, reject) => {
-          promptTimeout = setTimeout(() => {
-            reject(new Error(`Codex 响应超时（${Math.round(promptTimeoutMs / 1000)}秒），已重置 ACP 会话`));
-          }, promptTimeoutMs);
-        }),
-      ]);
+      if (request.longTask) {
+        promptResult = await conn.prompt({ sessionId, prompt: blocks });
+      } else {
+        promptResult = await Promise.race([
+          conn.prompt({ sessionId, prompt: blocks }),
+          new Promise<never>((_, reject) => {
+            promptTimeout = setTimeout(() => {
+              reject(new Error(`Codex 响应超时（${Math.round(promptTimeoutMs / 1000)}秒），已重置 ACP 会话`));
+            }, promptTimeoutMs);
+          }),
+        ]);
+      }
     } catch (error) {
       if (error instanceof Error && error.message.startsWith("Codex 响应超时")) {
         log(`prompt timeout after ${promptTimeoutMs}ms, restarting ACP subprocess`);
@@ -258,12 +269,27 @@ export class AcpAgent implements Agent {
       if (promptTimeout) clearTimeout(promptTimeout);
       progress.stop();
       this.connection.unregisterCollector(sessionId);
+      this.activePrompts.delete(request.conversationId);
+    }
+
+    if (this.cancelledPrompts.delete(request.conversationId)) {
+      log(`cancelled prompt completed conversation=${request.conversationId}`);
+      return { text: "" };
     }
 
     const response = await collector.toResponse();
     response.text = appendTurnSummary(response.text, Date.now() - startedAt, promptResult?.usage, this.sessionModels.get(request.conversationId));
     log(`response: ${response.text?.slice(0, 80) ?? "[no text]"}${response.media ? " +media" : ""}`);
     return response;
+  }
+
+  async cancelSession(conversationId: string): Promise<boolean> {
+    const active = this.activePrompts.get(conversationId);
+    if (!active) return false;
+    log(`cancelling ${active.longTask ? "long task" : "prompt"} conversation=${conversationId}`);
+    this.cancelledPrompts.add(conversationId);
+    await this.connection.cancel(active.sessionId);
+    return true;
   }
 
   getDebugInfo(conversationId: string): string {
@@ -352,6 +378,8 @@ export class AcpAgent implements Agent {
     this.adminSessions.clear();
     this.sessionModels.clear();
     this.progressSequences.clear();
+    this.activePrompts.clear();
+    this.cancelledPrompts.clear();
     this.sessions.clear();
     this.acpProcessStartedAt = 0;
     this.connection.dispose();

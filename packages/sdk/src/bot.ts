@@ -22,6 +22,7 @@ import { getContextToken } from "./messaging/inbound.js";
 import { sendWeixinMediaFile } from "./messaging/send-media.js";
 import { markdownToPlainText, sendMessageWeixin } from "./messaging/send.js";
 import { monitorWeixinProvider } from "./monitor/monitor.js";
+import type { ProcessMessageDeps } from "./messaging/process-message.js";
 import { logger } from "./util/logger.js";
 
 const MEDIA_TEMP_DIR = path.join(os.tmpdir(), `weixin-agent-${os.userInfo().username}/media`);
@@ -52,6 +53,8 @@ export type StartOptions = {
   }) => Promise<void>;
   /** Schedule a service restart after the administrator receives the reply. */
   onRestart?: () => void | Promise<void>;
+  /** Cancel the current prompt for a conversation. */
+  onStop?: ProcessMessageDeps["onStop"];
   onAccountConnected?: (accountId: string) => void | Promise<void>;
 };
 
@@ -288,6 +291,7 @@ export function start(agent: Agent, opts?: StartOptions): Bot {
     abortSignal: opts?.abortSignal,
     onAddUser: opts?.onAddUser,
     onRestart: opts?.onRestart,
+    onStop: opts?.onStop,
     log,
   });
 

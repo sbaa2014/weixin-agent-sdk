@@ -22,6 +22,7 @@ export type MonitorWeixinOpts = {
   longPollTimeoutMs?: number;
   onAddUser?: ProcessMessageDeps["onAddUser"];
   onRestart?: ProcessMessageDeps["onRestart"];
+  onStop?: ProcessMessageDeps["onStop"];
   log?: (msg: string) => void;
 };
 
@@ -127,7 +128,7 @@ export async function monitorWeixinProvider(opts: MonitorWeixinOpts): Promise<vo
         const fromUserId = full.from_user_id ?? "";
         const cachedConfig = await configManager.getForUser(fromUserId, full.context_token);
 
-        await processOneMessage(full, {
+        void processOneMessage(full, {
           accountId,
           agent,
           baseUrl,
@@ -136,8 +137,11 @@ export async function monitorWeixinProvider(opts: MonitorWeixinOpts): Promise<vo
           typingTicket: cachedConfig.typingTicket,
           onAddUser: opts.onAddUser,
           onRestart: opts.onRestart,
+          onStop: opts.onStop,
           log,
           errLog,
+        }).catch((err) => {
+          errLog(`[weixin] message processing error: ${String(err)}`);
         });
       }
     } catch (err) {

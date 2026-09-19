@@ -51,6 +51,13 @@ export class AcpConnection {
     this.collectors.delete(sessionId);
   }
 
+  /** Ask the ACP agent to stop the current prompt turn for a session. */
+  async cancel(sessionId: SessionId): Promise<void> {
+    if (this.connection) {
+      await this.connection.cancel({ sessionId });
+    }
+  }
+
   getStatus(): { ready: boolean; pid: number | null } {
     return { ready: this.ready, pid: this.process?.pid ?? null };
   }

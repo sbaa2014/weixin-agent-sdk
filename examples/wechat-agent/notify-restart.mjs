@@ -17,8 +17,18 @@ const AGENT_DIR = path.dirname(new URL(import.meta.url).pathname);
 const PKG = JSON.parse(fs.readFileSync(path.join(AGENT_DIR, "package.json"), "utf-8"));
 const BUILD = (() => {
   try {
-    const files = fs.readdirSync(AGENT_DIR).filter(f => f.endsWith(".mjs") || f.endsWith(".sh"));
-    const latest = Math.max(...files.map(f => fs.statSync(path.join(AGENT_DIR, f)).mtimeMs));
+    const files = fs.readdirSync(AGENT_DIR)
+      .filter(f => f.endsWith(".mjs") || f.endsWith(".sh"))
+      .map(f => path.join(AGENT_DIR, f));
+    // The running agent is built from packages/*/dist, not from this example
+    // directory. Include those artifacts so restart notifications show the
+    // actual deployed build time.
+    files.push(
+      path.resolve(AGENT_DIR, "../../packages/sdk/dist/index.mjs"),
+      path.resolve(AGENT_DIR, "../../packages/weixin-acp/dist/main.mjs"),
+    );
+    const existing = files.filter(f => fs.existsSync(f));
+    const latest = Math.max(...existing.map(f => fs.statSync(f).mtimeMs));
     const d = new Date(latest);
     return `${String(d.getMonth()+1).padStart(2,"0")}${String(d.getDate()).padStart(2,"0")}-${String(d.getHours()).padStart(2,"0")}${String(d.getMinutes()).padStart(2,"0")}`;
   } catch { return "?"; }

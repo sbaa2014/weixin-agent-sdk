@@ -36,6 +36,8 @@ export interface SlashCommandContext {
   errLog: (msg: string) => void;
   /** Called when /clear is invoked to reset the agent session. */
   onClear?: () => void;
+  /** Cancel the current prompt for this conversation. */
+  onStop?: (conversationId: string) => Promise<boolean> | boolean;
   /** Schedule a restart of the current agent service after the reply is sent. */
   onRestart?: () => void | Promise<void>;
   /** Diagnostic callback; must not invoke the model. */
@@ -134,6 +136,7 @@ export async function handleSlashCommand(
         ctx.onClear?.();
         await sendReply(ctx, "✅ 会话已清除，重新开始对话");
         return { handled: true };
+      }
       case "/restart": {
         if (!ctx.isAdmin) {
           await sendReply(ctx, "⛔ 只有管理员可以重启 agent");
@@ -148,6 +151,16 @@ export async function handleSlashCommand(
         setTimeout(() => void ctx.onRestart?.(), 300);
         return { handled: true };
       }
+      case "/stop":
+      case "/cancel": {
+        const cancelled = await ctx.onStop?.(ctx.to);
+        await sendReply(
+          ctx,
+          cancelled
+            ? "⛔ 已终止当前长任务。"
+            : "当前没有正在运行的长任务。",
+        );
+        return { handled: true };
       }
       case "/whoami": {
         await sendReply(ctx, `你的微信用户 ID:\n${ctx.to}`);
@@ -236,6 +249,8 @@ export async function handleSlashCommand(
           "  /users — root 查看允许使用的用户",
           "  /clear (清空) — 清除当前微信会话",
           "  /restart — 管理员重启 agent",
+          "  /long <任务> — 启动不自动超时的长任务",
+          "  /stop 或 /cancel — 终止当前长任务",
           "  /toggle-debug — 开关耗时调试",
           "  /echo 文本 — 测试微信通道延迟",
           "  /help (帮助) — 显示此帮助",

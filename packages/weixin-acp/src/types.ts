@@ -9,6 +9,6 @@ export type AcpAgentOptions = {
   cwd?: string;
   /** WeChat account handled by this agent; used for multi-tenant routing. */
   accountId?: string;
-  /** Prompt timeout in milliseconds (default: 120_000) */
+  /** Prompt timeout in milliseconds (default: 600_000) */
   promptTimeoutMs?: number;
 };

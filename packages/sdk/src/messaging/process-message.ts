@@ -65,6 +65,8 @@ export type ProcessMessageDeps = {
   }) => Promise<void>;
   /** Schedule a service restart after the administrator receives the reply. */
   onRestart?: () => void | Promise<void>;
+  /** Cancel the current prompt for a conversation. */
+  onStop?: (conversationId: string) => Promise<boolean> | boolean;
 };
 
 /** Extract raw text from item_list (for slash command detection). */
@@ -158,7 +160,17 @@ export async function processOneMessage(
   }
 
   // --- Slash commands ---
-  if (textBody.trim().startsWith("/") || /^(?:clear|清空|重置)$/i.test(textBody.trim())) {
+  const trimmedText = textBody.trim();
+  const longTaskMatch = /^\/long(?:\s+([\s\S]+))?$/i.exec(trimmedText);
+  if (longTaskMatch && !longTaskMatch[1]?.trim()) {
+    await sendMessageWeixin({
+      to: conversationId,
+      text: "用法: /long <任务>\n长任务不会自动超时，每分钟提醒一次；发送 /stop 或 /cancel 终止。",
+      opts: { baseUrl: deps.baseUrl, token: deps.token, contextToken: full.context_token },
+    });
+    return;
+  }
+  if (!longTaskMatch && (trimmedText.startsWith("/") || /^(?:clear|清空|重置)$/i.test(trimmedText))) {
     const slashResult = await handleSlashCommand(
       textBody,
       {
@@ -171,6 +183,7 @@ export async function processOneMessage(
         errLog: deps.errLog,
         onClear: () => deps.agent.clearSession?.(conversationId),
         onRestart: deps.onRestart,
+        onStop: deps.onStop ?? (() => deps.agent.cancelSession?.(conversationId) ?? false),
         getDebugInfo: () => deps.agent.getDebugInfo?.(conversationId) ?? "当前 agent 未提供诊断信息",
         isAdmin: senderIsAdmin,
         onAddUser: deps.onAddUser,
@@ -224,7 +237,8 @@ export async function processOneMessage(
   // --- Build ChatRequest ---
   const request: ChatRequest = {
     conversationId: full.from_user_id ?? "",
-    text: bodyFromItemList(full.item_list),
+    text: longTaskMatch?.[1]?.trim() ?? bodyFromItemList(full.item_list),
+    longTask: Boolean(longTaskMatch),
     media,
   };
 

@@ -217,6 +217,7 @@ async function startAgents(acpCommand: string, acpArgs: string[] = []) {
         });
         child.unref();
       },
+      onStop: (conversationId) => agent.cancelSession(conversationId),
       log: (msg) => console.log(`[${accountId}] ${msg}`),
     });
     runtimes.set(accountId, { agent, bot });

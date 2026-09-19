@@ -11,6 +11,8 @@ export interface Agent {
   chat(request: ChatRequest): Promise<ChatResponse>;
   /** Clear/reset the session for a given conversation. */
   clearSession?(conversationId: string): void;
+  /** Cancel the currently running prompt for a conversation. */
+  cancelSession?(conversationId: string): Promise<boolean>;
   /** Return lightweight diagnostic information without calling the model. */
   getDebugInfo?(conversationId: string): string | Promise<string>;
 }
@@ -20,6 +22,8 @@ export interface ChatRequest {
   conversationId: string;
   /** Text content of the message. */
   text: string;
+  /** Disable the normal prompt timeout and keep progress notifications running. */
+  longTask?: boolean;
   /** Attached media file (image, audio, video, or generic file). */
   media?: {
     type: "image" | "audio" | "video" | "file";
