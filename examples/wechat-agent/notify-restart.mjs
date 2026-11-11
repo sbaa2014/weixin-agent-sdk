@@ -11,6 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
 
 const HOME = os.homedir();
 const AGENT_DIR = path.dirname(new URL(import.meta.url).pathname);
@@ -185,6 +186,12 @@ function loadConfiguredModel() {
 }
 
 const model = loadConfiguredModel() || "Codex（本机配置）";
+let codexVersion = "未知";
+try {
+  codexVersion = execFileSync(process.env.CODEX_PATH || "codex", ["--version"], {
+    encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+  }).trim() || "未知";
+} catch { /* 启动通知不应因版本查询失败而中断 */ }
 const nodeVer = process.version;
 const pid = process.ppid || process.pid;
 const mem = Math.round(process.memoryUsage().rss / 1024 / 1024);
@@ -209,6 +216,7 @@ for (const account of accounts) {
   const text = [
     `wechat-agent v${PKG.version} (${BUILD}) 已启动`,
     `模型: ${model}  时间: ${now}`,
+    `Codex: ${codexVersion}`,
     `Node: ${nodeVer}  PID: ${pid}  内存: ${mem}MB`,
     `账号: ${account.accountId}`,
     `会话: 本次启动使用新的 Codex 会话，不恢复旧版 Claude 对话`,
