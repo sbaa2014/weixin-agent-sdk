@@ -14,6 +14,22 @@ If the user asks to resend an existing PDF, call `create_pdf` again using the
 known document content; do not claim a workspace file was sent unless the
 tool returns a success message containing `[已发送PDF到微信]`.
 
+## Temporary artifacts
+
+Save generated HTML, PDF, images, and other temporary artifacts under the
+`WECHAT_ARTIFACT_DIR` environment variable. The agent creates a timestamped
+run directory under `/tmp` at startup and removes artifact directories older
+than 7 days. Do not put generated temporary files in the repository root.
+
+## Import status requests
+
+When monitoring import status, use the v6 offline replay monitor from the
+workspace with a 10-minute window and debug output:
+
+```bash
+python3 skills/data/usprod_offline_replay_100k_v6/scripts/monitor_broker_ingest.py --once --debug --minutes 10
+```
+
 ## Image requests
 
 For requests to find or show images, do one search and fetch at most 3 useful

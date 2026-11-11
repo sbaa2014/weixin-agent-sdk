@@ -1,9 +1,11 @@
 import type { Agent, ChatRequest, ChatResponse } from "weixin-agent-sdk";
+import { execFile } from "node:child_process";
 import type { SessionId, Usage } from "@agentclientprotocol/sdk";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 
 import type { AcpAgentOptions } from "./types.js";
 import { AcpConnection } from "./acp-connection.js";
@@ -18,6 +20,10 @@ function log(msg: string) {
 // lifetime. Recycle it periodically so a refreshed auth.json is picked up
 // without requiring a full wechat-agent restart.
 const DEFAULT_CODEX_ACP_MAX_LIFETIME_MS = 12 * 60 * 60 * 1000;
+const PROXY_TUNNEL_RESTART_COOLDOWN_MS = 5 * 60 * 1000;
+const execFileAsync = promisify(execFile);
+let proxyTunnelRestartedAt = 0;
+let proxyTunnelRestartInFlight: Promise<void> | null = null;
 
 function getCodexAcpMaxLifetimeMs(): number {
   const configured = Number.parseInt(process.env.CODEX_ACP_MAX_LIFETIME_MS ?? "", 10);
@@ -31,6 +37,49 @@ function isAuthenticationFailure(error: unknown): boolean {
   return /(?:401|unauthori[sz]ed|invalid token|token[^\n]{0,80}expired|expired[^\n]{0,80}token|authentication required|login required)/i.test(
     message,
   );
+}
+
+function describeAcpError(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const data = (error as Error & { data?: unknown }).data;
+  const details =
+    data && typeof data === "object" && "details" in data && typeof data.details === "string"
+      ? data.details
+      : undefined;
+  return details ? `${error.message}: ${details}` : error.message;
+}
+
+function isWorkspaceRoutingFailure(error: unknown): boolean {
+  return /workspace routing discovery (?:timed out|failed)/i.test(describeAcpError(error));
+}
+
+async function restartProxyTunnelIfAllowed(): Promise<boolean> {
+  if (proxyTunnelRestartInFlight) {
+    await proxyTunnelRestartInFlight;
+    return true;
+  }
+
+  if (Date.now() - proxyTunnelRestartedAt < PROXY_TUNNEL_RESTART_COOLDOWN_MS) {
+    log("代理隧道处于 5 分钟重启冷却期，跳过本次重启");
+    return false;
+  }
+
+  proxyTunnelRestartedAt = Date.now();
+  log("重启 SOCKS 代理隧道: socks-tunnel.service");
+  const restart = execFileAsync(
+    "/usr/bin/sudo",
+    ["-n", "/usr/bin/systemctl", "restart", "socks-tunnel.service"],
+    { timeout: 30_000 },
+  ).then(() => {
+    log("SOCKS 代理隧道重启完成");
+  });
+  proxyTunnelRestartInFlight = restart;
+  try {
+    await restart;
+    return true;
+  } finally {
+    if (proxyTunnelRestartInFlight === restart) proxyTunnelRestartInFlight = null;
+  }
 }
 
 type WechatAccount = { token: string; baseUrl: string; userId: string };
@@ -202,8 +251,36 @@ export class AcpAgent implements Agent {
       this.acpProcessStartedAt = Date.now();
     }
 
-    // Get or create an ACP session for this conversation
-    const sessionId = await this.getOrCreateSession(request.conversationId, conn);
+    // Get or create an ACP session for this conversation. A workspace-routing
+    // timeout can leave the shared SSH tunnel unusable, so restart it once and
+    // retry session creation with a fresh ACP subprocess.
+    let sessionId: SessionId;
+    try {
+      sessionId = await this.getOrCreateSession(request.conversationId, conn);
+    } catch (error) {
+      if (!isWorkspaceRoutingFailure(error)) throw error;
+
+      log(`workspace routing failed while creating session: ${describeAcpError(error)}`);
+      let tunnelRestarted: boolean;
+      try {
+        tunnelRestarted = await restartProxyTunnelIfAllowed();
+      } catch (restartError) {
+        const message = describeAcpError(restartError);
+        log(`SOCKS 代理隧道自动重启失败: ${message}`);
+        throw new Error(`${describeAcpError(error)}；自动重启代理隧道失败：${message}`);
+      }
+
+      this.resetAcp("workspace routing failure; retrying after proxy recovery");
+      try {
+        const retryConnection = await this.connection.ensureReady();
+        this.acpProcessStartedAt = Date.now();
+        sessionId = await this.getOrCreateSession(request.conversationId, retryConnection);
+      } catch (retryError) {
+        this.resetAcp("session creation retry after proxy recovery failed");
+        const action = tunnelRestarted ? "代理隧道已重启并重试一次" : "代理隧道处于重启冷却期，已重试一次";
+        throw new Error(`${describeAcpError(retryError)}（${action}）`);
+      }
+    }
     if (this.isAdminUser(request.conversationId)) this.adminSessions.add(sessionId);
     else this.adminSessions.delete(sessionId);
 

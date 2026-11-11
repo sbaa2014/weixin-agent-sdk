@@ -45,6 +45,31 @@ const BUILTIN_AGENTS: Record<string, { command: string }> = {
 
 const command = process.argv[2];
 
+const ARTIFACT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+async function prepareArtifactTempDir(): Promise<string> {
+  const root = path.join(os.tmpdir(), `wechat-agent-${os.userInfo().username}`, "artifacts");
+  await fs.mkdir(root, { recursive: true });
+  const cutoff = Date.now() - ARTIFACT_RETENTION_MS;
+  for (const entry of await fs.readdir(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const entryPath = path.join(root, entry.name);
+    try {
+      const stat = await fs.stat(entryPath);
+      if (stat.mtimeMs < cutoff) await fs.rm(entryPath, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup; an in-use or disappearing artifact must not block startup.
+    }
+  }
+  const now = new Date();
+  const stamp = now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+  const runDir = path.join(root, `${stamp}-${process.pid}`);
+  await fs.mkdir(runDir, { recursive: true });
+  process.env.WECHAT_ARTIFACT_DIR = runDir;
+  console.log(`[weixin] 临时产物目录: ${runDir} (保留 7 天)`);
+  return runDir;
+}
+
 async function ensureLoggedIn() {
   if (!isLoggedIn()) {
     console.log("未检测到登录信息，请先扫码登录微信\n");
@@ -64,6 +89,7 @@ function resolveAccountIds(): string[] {
 }
 
 async function startAgents(acpCommand: string, acpArgs: string[] = []) {
+  await prepareArtifactTempDir();
   await ensureLoggedIn();
 
   const accountIds = resolveAccountIds();
